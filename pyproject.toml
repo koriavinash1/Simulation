@@ -1,0 +1,26 @@
+[project]
+name = "blurgs-global-fisheries-digital-twin"
+version = "0.1.0"
+description = "Multi-agent bioeconomic digital twin for simulating EM adoption, fisheries management, ecosystem dynamics, and economic impacts."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "pillow>=13.0.0",
+    "plotly>=5.20",
+    "pyarrow>=15.0",
+    "shapely>=2.2.0",
+    "streamlit>=1.40",
+    "watchdog>=6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
