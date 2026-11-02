@@ -1,8 +1,10 @@
+> **Current specification:** [MODEL_CORRECTIONS.md](MODEL_CORRECTIONS.md) supersedes older calibration claims. All coefficients below are scenario/reference priors unless independently validated. The planning default composes 1.5% real price growth and 2.2% inflation into 3.733% nominal price growth. The historical comparison uses approximately 1.30% nominal growth; the $6B baseline is a scenario anchor. Reallocation support and awareness are also exposed controls.
+
 ### Active Scenario Controls
 
 The scenario sidebar exposes 5 primary bioeconomic policy and environmental forcing controls:
 
-1. **EM Adoption Ceiling (`em_adoption_max_pct`):** Upper fleet adoption tendency (0–100%). Installation is assigned across vessel size classes; realized coverage drives management observability ($Q_t$), mandates circle hooks/tori lines, eliminates non-compliance on equipped vessels, and unlocks export certification eligibility.
+1. **EM Adoption Ceiling (`em_adoption_max_pct`):** Upper fleet adoption tendency (0–100%). Installation is assigned across vessel size classes; realized coverage drives management observability ($Q_t$), mandates circle hooks/tori lines, reduces non-compliance propensity on equipped vessels, and unlocks export certification eligibility.
 2. **Verified Market Premium (`premium_max_pct`):** Export market price premium (0–20%) realized exclusively by compliant EM vessels, driving the economic reform dividend.
 3. **Dynamic MPA Expansion / Spatial Push (`government_mpa_push_max_pct`):** Policy pressure (0–50%) that endogenously shifts marine reserve centroids $\vec{C}_k(t)$ toward the Conservation Priority Field $\Psi(g, t)$ (depleted tuna stocks + fleet congestion + bycatch corridors) and expands reserve radii.
 4. **General Compliance & Enforcement Push (`enforcement_push_max_pct`):** Surveillance fine intensity multiplier (0–60%) and norm pressure ($1 - 0.55 G_t$) that deters unmonitored vessels from poaching inside reserves.
@@ -17,7 +19,7 @@ The remaining parameters are calibrated scientific priors located in `sim/global
 | Parameter | Default | Meaning | Calibration Target / Empirical Reference |
 |:---|---:|:---|:---|
 | Registered longliners | 7,288 | Global longline fleet population | FAO / Tuna-RFMO / ISSF global vessel registries |
-| Baseline violation probability | 5.5% | Reference non-compliance propensity | Empirical paper-park poaching scenarios |
+| Baseline violation probability | 22% | Reference non-compliance propensity | Empirical paper-park poaching scenarios |
 | Residual violation floor | 0.75% | Non-zero non-compliance floor | Prevents artificial zero violation assumptions |
 | EM equipment Capex | $28,000 | Hardware & camera installation amortized over 5 yrs | Commercial hardware BOM & industry estimates |
 | EM ongoing Opex | $9,500/yr | Video review, audit & satellite communications | Operational industry averages |

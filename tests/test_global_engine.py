@@ -262,5 +262,65 @@ def test_regional_species_bounds_and_zero_polar_yft():
             assert np.any(yft_bio[trop_mask] > 0.0), f"YFT biomass missing in tropics in {sc} fr {fr}"
 
 
+def test_fishing_days_and_operational_efficiency():
+    from pathlib import Path
+    from sim.global_data import load_world
+    from sim.global_engine import run_paired_global
+
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    world, _ = load_world(data_dir)
+    cfg = GlobalSimulationConfig(years=3, representative_agents=100, seed=42)
+    res = run_paired_global(cfg, world, 30)
+
+    for sc in ["BAU", "EM"]:
+        ann = res[sc].annual
+        mon = res[sc].monthly
+        # Assert fishing_days and effort_hours exist and are positive
+        assert "fishing_days" in ann.columns and (ann["fishing_days"] > 0).all()
+        assert "effort_hours" in ann.columns and (ann["effort_hours"] > 0).all()
+        assert "revenue_per_day" in ann.columns and (ann["revenue_per_day"] > 0).all()
+        assert "catch_per_day" in ann.columns and (ann["catch_per_day"] > 0).all()
+
+        assert "fishing_days" in mon.columns and (mon["fishing_days"] > 0).all()
+        assert "revenue_per_day" in mon.columns and (mon["revenue_per_day"] > 0).all()
+
+    # In EM intervention, revenue per fishing day must be higher due to observability and spillover
+    mean_em_rpd = float(res["EM"].annual["revenue_per_day"].mean())
+    mean_bau_rpd = float(res["BAU"].annual["revenue_per_day"].mean())
+    assert mean_em_rpd > mean_bau_rpd, f"EM revenue/day (${mean_em_rpd:.0f}) should exceed BAU (${mean_bau_rpd:.0f})"
+
+    # In EM, total fishing days should be lower or equal (fewer days wasted on blind search steaming)
+    tot_em_days = float(res["EM"].annual["fishing_days"].sum())
+    tot_bau_days = float(res["BAU"].annual["fishing_days"].sum())
+    assert tot_em_days <= tot_bau_days, f"EM fishing days ({tot_em_days:,.0f}) should be <= BAU ({tot_bau_days:,.0f})"
 
 
+def test_zero_controls_identity():
+    from pathlib import Path
+    from sim.global_data import load_world
+    from sim.global_engine import run_paired_global
+    import numpy as np
+
+    data_dir = Path(__file__).resolve().parents[1] / "data"
+    world, _ = load_world(data_dir)
+    cfg = GlobalSimulationConfig(
+        years=3,
+        representative_agents=100,
+        seed=42,
+        em_adoption_max_pct=0.0,
+        em_awareness_effect_max_pct=0.0,
+        government_mpa_push_max_pct=0.0,
+        government_reallocation_support_max_pct=0.0,
+        enforcement_push_max_pct=0.0,
+        premium_max_pct=0.0,
+        mpa_redesign_enabled=False,
+    )
+    res = run_paired_global(cfg, world, 0)
+    bau_ann = res["BAU"].annual
+    em_ann = res["EM"].annual
+
+    # When all policy sliders are set to zero, EM and BAU must be 100% identical
+    np.testing.assert_allclose(bau_ann["landed_value"].values, em_ann["landed_value"].values, rtol=1e-5, atol=1e-3)
+    np.testing.assert_allclose(bau_ann["catch_tonnes"].values, em_ann["catch_tonnes"].values, rtol=1e-5, atol=1e-3)
+    np.testing.assert_allclose(bau_ann["fishing_days"].values, em_ann["fishing_days"].values, rtol=1e-5, atol=1e-3)
+    np.testing.assert_allclose(bau_ann["fleet_profit"].values, em_ann["fleet_profit"].values, rtol=1e-5, atol=1e-3)

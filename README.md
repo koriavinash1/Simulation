@@ -18,6 +18,10 @@ uv run pytest -q                # run tests
 
 For development dependencies, `uv sync` installs the default `dev` dependency group containing pytest.
 
+## Current model and historical revenue context
+
+See [coupling corrections, historical FAO sources and current verification](docs/MODEL_CORRECTIONS.md). Revenue is nominal USD; inflation-adjusted revenue is reported separately. All intervention controls at zero produce identical BAU and EM outputs. The default planning scenario assumes 1.5% real price growth and composes inflation into nominal prices. A historical nominal-proxy comparison remains available. Neither scenario forces revenue to grow.
+
 ## Master Technical & Socio-Economic Report
 
 For the complete mathematical specification, simulation philosophy, bioeconomic J-curve valuation, crew livelihood analysis, and World Bank macroeconomic growth benchmarking, refer to:
@@ -92,7 +96,7 @@ This repository does not redistribute datasets whose terms may require registrat
 uv run pytest -q
 ```
 
-Current suite: 6 tests.
+Tests include paired-world identity, horizon consistency, stock conservation and extraction accounting, spatial boundaries and economic output checks.
 
 ## Important interpretation
 

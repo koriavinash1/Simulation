@@ -1,11 +1,12 @@
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from .global_config import GlobalSimulationConfig
+from .config import GlobalSimulationConfig
+from .coupling import allocate_removals, conservative_exchange, monthly_stock_step
 
 try:
     from shapely.geometry import Point
@@ -48,13 +49,40 @@ class GlobalSimulationResult:
 
 def _softmax(x, axis=1):
     z=x-np.max(x,axis=axis,keepdims=True)
-    e=np.exp(np.clip(z,-35,35))
+    e=np.where(np.isneginf(x), 0.0, np.exp(np.clip(z,-35,35)))
     return e/np.maximum(e.sum(axis=axis,keepdims=True),1e-12)
 
 
 def _sample_cat(p,rng):
     u=rng.random(p.shape[0]); c=np.cumsum(p,axis=1)
     return (u[:,None]>c).sum(axis=1).clip(0,p.shape[1]-1)
+
+
+def _transform_mpa(geometry, origin, center, expansion):
+    """One dateline-aware transform shared by fishing exposure and rendering."""
+    def ring(points):
+        return [[float(((center[0] + (((x-origin[0]+180)%360)-180)*expansion + 180)%360)-180),
+                 float(np.clip(center[1] + (y-origin[1])*expansion, -89, 89))]
+                for x, y, *_ in points]
+    polygons = geometry["coordinates"] if geometry["type"] == "MultiPolygon" else [geometry["coordinates"]]
+    coords = [[ring(r) for r in polygon] for polygon in polygons]
+    return {"type": "MultiPolygon", "coordinates": coords}
+
+
+def _polygon_exposure(geometries, lon, lat):
+    """Exact point-in-polygon exposure, unwrapped per polygon at the dateline."""
+    from shapely.geometry import Polygon
+    from shapely import intersects_xy
+    exposure = np.zeros(len(lon), dtype=bool)
+    for geometry in geometries:
+        for rings in geometry["coordinates"]:
+            if not rings or not rings[0]:
+                continue
+            anchor = rings[0][0][0]
+            unwrap = lambda r: [(anchor + ((x-anchor+180)%360)-180, y) for x, y in r]
+            polygon = Polygon(unwrap(rings[0]), [unwrap(r) for r in rings[1:]])
+            exposure |= intersects_xy(polygon, anchor + ((lon-anchor+180)%360)-180, lat)
+    return exposure.astype(float)
 
 
 def _make_agents(cfg, world, rng):
@@ -66,11 +94,11 @@ def _make_agents(cfg, world, rng):
     effort=np.array([145,205,275,330])[cls]*rng.lognormal(0,.12,n)
     catchability=np.array([.70,.95,1.30,1.52])[cls]*rng.lognormal(0,.14,n)
     fuel=np.array([34,58,105,155])[cls]*rng.lognormal(0,.12,n)
-    fixed=np.array([11000,23000,52000,89000])[cls]*rng.lognormal(0,.09,n)
-    crew=np.array([8500,17000,34000,52000])[cls]*rng.lognormal(0,.08,n)
+    fixed=np.array([4500,8500,18000,32000])[cls]*rng.lognormal(0,.09,n)
+    crew=np.array([6500,12500,24000,38000])[cls]*rng.lognormal(0,.08,n)
     risk=np.clip(rng.beta(2.0,24.0,n)*1.8,0.005,.35)
     exploration=np.clip(rng.beta(2.5,18,n),.02,.30)
-    
+
     # Target species assignment reflecting global pelagic longline fleet composition:
     # Target species assignment reflecting global pelagic longline fleet composition:
     # Yellowfin (40%), Bigeye (25%), Albacore (20%), Swordfish (15%)
@@ -98,14 +126,6 @@ def _make_agents(cfg, world, rng):
 
 
 
-def _assign_em(cfg, agents, rng):
-    # Each vessel gets its own adoption probability; realised adoption fluctuates around the user ceiling.
-    n=agents["n"]
-    ceiling=np.clip(cfg.em_adoption_max_pct/100,0,1)
-    p=ceiling*np.clip(0.55+0.30*(agents["capacity"]/np.mean(agents["capacity"]))+rng.normal(0,.10,n),.15,1.35)
-    return rng.random(n)<np.clip(p,0,1)
-
-
 def _climate_path(cfg, months, rng):
     # User supplies only extremity ceiling. Direction, timing and persistence are stochastic.
     maxamp=np.clip(cfg.climate_extremity_max_pct/100,0,1)
@@ -119,17 +139,45 @@ def _climate_path(cfg, months, rng):
     return x
 
 
-def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, intervention=True, animation_agents=500, step_callback=None):
-    seed=cfg.seed+(7001 if intervention else 0)
-    # paired exogenous world: agents/climate use shared streams; intervention stream is separate.
+def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, intervention=True, animation_agents=500, step_callback=None, _calibration_factor=None):
+    # paired exogenous world: agents, climate and baseline exploration use shared streams;
+    # intervention-only draws use a separate stream so zero-intervention runs are 100% identical.
     rng_agents=np.random.default_rng(cfg.seed+101)
+    if cfg.years < 1 or cfg.representative_agents < 1 or cfg.n_vessels < 1:
+        raise ValueError("Years and vessel counts must be positive")
+    if not 0 < cfg.initial_stock_fraction < 1 or cfg.em_amortization_years <= 0 or cfg.harvest_pressure_scale <= 0:
+        raise ValueError("Initial stock fraction must be in (0, 1); amortization must be positive")
+    if cfg.annual_price_drift <= -1 or cfg.annual_inflation_rate <= -1:
+        raise ValueError("Price and inflation rates must exceed -100%")
+    for field in ("em_adoption_max_pct", "em_awareness_effect_max_pct", "premium_max_pct",
+                  "climate_extremity_max_pct", "government_mpa_push_max_pct",
+                  "government_reallocation_support_max_pct", "enforcement_push_max_pct"):
+        if not 0 <= getattr(cfg, field) <= 100:
+            raise ValueError(f"{field} must be between 0 and 100")
+    if world.empty or not np.isfinite(world.select_dtypes(include=np.number)).all().all():
+        raise ValueError("World cells must be nonempty and finite")
+    if _calibration_factor is None:
+        # The scale is linear in physical catch, stock units and sales. Estimate
+        # it once in a pre-policy reference year, then share it across scenarios.
+        pilot = simulate_global(replace(cfg, years=1), world, False, 0, _calibration_factor=1.0)
+        observed = float(pilot.annual.landed_value.iloc[0])
+        if observed <= 0:
+            raise ValueError("World must support positive baseline target catch")
+        _calibration_factor = cfg.baseline_landed_value_billion*1e9 / observed
     rng_exo=np.random.default_rng(cfg.seed+202)
-    rng=np.random.default_rng(seed+303)
+    rng_market=np.random.default_rng(cfg.seed+203)
+    rng_climate=np.random.default_rng(cfg.seed+204)
+    rng=np.random.default_rng(cfg.seed+303)
+    rng_interv=np.random.default_rng(cfg.seed+7001)
     agents=_make_agents(cfg,world,rng_agents)
-    em=_assign_em(cfg,agents,np.random.default_rng(cfg.seed+404)) if intervention else np.zeros(agents["n"],bool)
     n=agents["n"]; W=agents["weight"]; G=len(world)
+    em_rng = np.random.default_rng(cfg.seed + 404)
+    em_target_ceiling = np.clip(cfg.em_adoption_max_pct / 100, 0, 1)
+    p_vessel = np.clip(0.55 + 0.30 * (agents["capacity"] / np.mean(agents["capacity"])) + em_rng.normal(0, 0.10, n), 0.15, 1.0)
+    adoption_order = np.argsort(-p_vessel)
+    em = np.zeros(n, bool)
     months=cfg.years*12
-    climate=_climate_path(cfg,months,rng_exo)
+    climate=_climate_path(cfg,months,rng_climate)
     codes=[s.code for s in cfg.species.values()]
     spp={s.code:s for s in cfg.species.values()}
 
@@ -137,13 +185,16 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
     biomass = {}
     for c in codes:
         suit_c = world[f"suit_{c}"].values
-        biomass[c] = np.where(suit_c > 0.015, np.clip(0.12 + 0.98 * suit_c, 0.02, 1.25), 0.0)
+        biomass[c] = np.where(suit_c > 0.015, cfg.initial_stock_fraction * spp[c].carrying_capacity * suit_c, 0.0)
     initial = {c: b.copy() for c, b in biomass.items()}
     mpa=np.clip(world.mpa_share.values.copy(),0,.65)
     effort_prior=np.maximum(world.effort_prior.values,1e-12)
+    effort_prior = effort_prior / effort_prior.sum()
     # Biodiversity suitability matrix per vessel target species
     suit_matrix = np.array([world[f"suit_{agents['target_species'][i]}"].values for i in range(n)])
     is_resident_matrix = suit_matrix > 0.015
+    if not is_resident_matrix.any(axis=1).all():
+        raise ValueError("World must contain resident habitat for every target species")
     # agent historical preferences around home cell plus global effort hotspots, bounded to resident habitat.
     lon=world.lon.values; lat=world.lat.values
     pref=np.empty((n,G),dtype=np.float32)
@@ -171,11 +222,10 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
     annual_rows=[]; monthly_rows=[]; species_rows=[]; anim=[]
     cumulative_violation=np.zeros(n)
     profit_total=np.zeros(n); catch_total=np.zeros(n); bycatch_total=np.zeros(n)
-    prev_supply=1.0
     price_index=1.0; fuel_price=cfg.fuel_price_litre
     scale=1.0
 
-    # Load authoritative MPA layer for coupled dynamic spatial optimization
+    # Load the installed MPA layer for coupled dynamic spatial optimization
     mpa_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "marine_mpas.geojson"
     mpa_features = []
     base_cents_list = []
@@ -190,7 +240,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                 polys = coords if feat["geometry"]["type"] == "MultiPolygon" else [coords]
                 pts = [pt for poly in polys if poly and poly[0] for pt in poly[0]]
                 if pts:
-                    base_cents_list.append((float(np.mean([pt[0] for pt in pts])), float(np.mean([pt[1] for pt in pts]))))
+                    base_cents_list.append((float(np.rad2deg(np.arctan2(np.mean(np.sin(np.deg2rad([pt[0] for pt in pts]))), np.mean(np.cos(np.deg2rad([pt[0] for pt in pts])))))), float(np.mean([pt[1] for pt in pts]))))
                 else:
                     base_cents_list.append((0.0, 0.0))
                 area = feat["properties"].get("area_km2", 400000)
@@ -202,16 +252,59 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
     base_radii = np.array(base_radii_list) if base_radii_list else np.empty(0)
     curr_cents = base_cents.copy()
     n_mpas = len(base_cents)
+    expansion_state = np.ones(n_mpas, dtype=np.float32)
     mpa_frames = {}
     bio_frames = {}
     congestion = effort_prior.copy() / effort_prior.sum()
 
-    # baseline scale from desired open-data reference value; catch shares/prices create the composition.
-    target_monthly=cfg.baseline_landed_value_billion*1e9/12
-    base_unit=(agents["effort"]*agents["capacity"]*agents["catchability"]*W).sum()
-    mean_price=np.mean([s.base_price_tonne for s in cfg.species.values() if not s.bycatch and s.base_price_tonne>0])
-    scale=target_monthly/max(base_unit*mean_price*.65,1)
-    prev_supply=float(target_monthly/max(mean_price,1))
+    # Expected pre-policy catch over all possible grounds, not a particular
+    # stochastic first month. Both worlds use exactly the same calibration.
+    reference_attraction = np.log(pref + 1e-9)
+    for i in range(n):
+        reference_attraction[i] += 0.82 * np.log(initial[agents["target_species"][i]] + 1e-4)
+    reference_attraction -= 0.25 * mpa[None, :]
+    reference_attraction[~is_resident_matrix] = -np.inf
+    reference_p = _softmax(reference_attraction)
+    explore = is_resident_matrix / np.maximum(is_resident_matrix.sum(axis=1, keepdims=True), 1)
+    reference_p = (1-agents["exploration"][:, None])*reference_p + agents["exploration"][:, None]*explore
+    expected_congestion = np.sum(reference_p * W[:, None], axis=0) / W.sum()
+    reference_crowd = np.clip(1-.25*(expected_congestion/np.maximum(effort_prior,.002)-1),.48,1.15)
+    expected_catch = {}
+    expected_value = 0.0
+    vessel_units = agents["effort"] * agents["capacity"] * agents["catchability"]
+    for c, sp in spp.items():
+        suit_c = world[f"suit_{c}"].values
+        local_bio = initial[c] * (.75 + .25*np.exp(-.5*(lat/45)**2))
+        cpue = local_bio**cfg.stock_cpue_elasticity * reference_crowd
+        share = (0.02 if c == "SHK" else 0.004 if c == "TUR" else 0.003) if sp.bycatch else suit_c
+        raw = np.sum(reference_p * (vessel_units*W)[:, None], axis=0) * cpue * share
+        expected_catch[c] = raw
+        maturity = .85 + .15 * np.divide(local_bio, initial[c], out=np.zeros(G), where=initial[c]>0)
+        if not sp.bycatch:
+            expected_value += float(np.sum(raw * sp.base_price_tonne * maturity))
+    target_monthly = cfg.baseline_landed_value_billion * 1e9 / 12
+    scale = target_monthly / max(expected_value, 1e-12) * _calibration_factor
+    reference_supply = sum(float(v.sum()*scale) for c,v in expected_catch.items() if not spp[c].bycatch)
+    capacities = {c: np.where(world[f"suit_{c}"].values > .015,
+                             sp.carrying_capacity*world[f"suit_{c}"].values, 0) for c,sp in spp.items()}
+    # Infer physical stock units from reference catch and surplus production at
+    # the initial B/K ratio. This is a transparent equilibrium prior, not observed biomass.
+    stock_units = {}
+    habitat_edges = {}
+    dl = ((lon[:,None]-lon[None,:]+180)%360)-180
+    da = lat[:,None]-lat[None,:]
+    distance = np.hypot(dl*np.cos(np.deg2rad((lat[:,None]+lat[None,:])/2)), da)
+    adjacency = (distance > 0) & (distance <= cfg.grid_deg*1.6)
+    for c,sp in spp.items():
+        B = initial[c]
+        production = (sp.growth_rate/12)*B*(1-cfg.initial_stock_fraction)
+        stock_units[c] = np.divide(expected_catch[c]*scale, production,
+                                   out=np.zeros(G), where=production>0)
+        # Relative to the reference pressure, a higher exploitation prior implies
+        # a smaller physical stock supporting the same initial fleet/catch.
+        stock_units[c] *= 0.035 / cfg.harvest_pressure_scale
+        resident = capacities[c] > 0
+        habitat_edges[c] = np.argwhere(np.triu(adjacency & resident[:,None] & resident[None,:], 1))
 
     prev_region=agents["home"].copy()
     home_h=agents["home"]
@@ -228,19 +321,34 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
         curr_lon=((lon[home_h]+rng_agents.uniform(-2.5,2.5,n)+180)%360)-180
         curr_lat=np.clip(lat[home_h]+rng_agents.uniform(-2.0,2.0,n),-55,55)
 
-    # In EM, verified export premium is robust: beta distribution with higher mean
-    premium_draw = np.random.default_rng(cfg.seed + 505).beta(2.2, 2.5, n) * (cfg.premium_max_pct / 100)
+    # Traceability export premium centered around configured premium target with realistic vessel contract heterogeneity
+    target_prem = cfg.premium_max_pct / 100.0
+    prem_heterogeneity = np.clip(np.random.default_rng(cfg.seed + 505).normal(1.0, 0.12, n), 0.75, 1.25)
+    premium_draw = target_prem * prem_heterogeneity
     aware_draw = np.random.default_rng(cfg.seed + 606).beta(2.8, 1.8, n) * (cfg.em_awareness_effect_max_pct / 100)
 
     for t in range(months):
         month=t%12; year=t//12+1
-        if month==0 and year > 1:
-            real_drift = math.exp(getattr(cfg, "annual_price_drift", 0.015))
-            price_index *= real_drift * math.exp(rng_exo.normal(-.5*cfg.price_volatility**2,cfg.price_volatility))
-            fuel_price *= math.exp(0.01 + rng_exo.normal(-.5*cfg.fuel_volatility**2,cfg.fuel_volatility))
+        # Structured pilot-to-ceiling rollout reaching full target ceiling within 24 months
+        rollout_phase = min(1.0, 0.15 + 0.85 * (t / 24.0)) if intervention else 0.0
+        target_count = int(round(n * em_target_ceiling * rollout_phase))
+        em = np.zeros(n, bool)
+        if intervention and target_count > 0:
+            em[adoption_order[:target_count]] = True
+        adoption = float(np.average(em, weights=W)) if intervention else 0.0
+
+        if month==0:
+            drift = getattr(cfg, "annual_price_drift", 0.015)
+            vol_p = getattr(cfg, "price_volatility", 0.02)
+            eps_p = rng_market.normal(0, 1)
+            # Nominal historical trend with mean-one lognormal annual variation.
+            price_index = ((1.0 + drift) ** (year - 1)) * math.exp(-0.5 * (vol_p ** 2) + vol_p * eps_p)
+            vol_f = getattr(cfg, "fuel_volatility", 0.03)
+            eps_f = rng_market.normal(0, 1)
+            fuel_price = cfg.fuel_price_litre * ((1.0 + 0.01) ** (year - 1)) * math.exp(-0.5 * (vol_f ** 2) + vol_f * eps_f)
         # climate shifts habitat latitudinally and reduces some local suitability.
         clim=climate[t]
-        temp_lat_shift=clim*12.0
+        temp_lat_shift=clim*12.0 * cfg.migration_temperature_pull / .45
 
         # Species-specific biomass attraction: each vessel targets its licensed biodiversity stock
         target_bio = np.zeros((n, G), dtype=np.float32)
@@ -250,7 +358,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
 
         attraction = np.log(pref + 1e-9) + 0.82 * np.log(target_bio + 1e-4)
         # Enforce strict boundary penalty outside resident biodiversity habitat
-        attraction[~is_resident_matrix] -= 15.0
+        attraction[~is_resident_matrix] = -np.inf
         # persistence of current grounds
         attraction[np.arange(n), prev_region] += 0.65
 
@@ -269,14 +377,14 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
         max_cong = max(float(congestion.max()), 1e-4)
         psi = depletion * (0.35 + 0.65 * (congestion / max_cong)) + 0.35 * bycatch_risk
 
-        gov_push = (cfg.government_mpa_push_max_pct / 100) * (t / max(months - 1, 1)) if intervention else 0
+        gov_push = (cfg.government_mpa_push_max_pct / 100) * min(1.0, t / max(cfg.policy_phase_in_months, 1)) if intervention else 0
 
         # Coupled spatial optimization: MPAs shift and expand ONLY when active fishing pressure or fleet presence is nearby
-        exp_k = np.ones(n_mpas, dtype=np.float32)
+        exp_k = expansion_state.copy()
         fishers_near_mpas = np.zeros(n_mpas, dtype=int)
-        if intervention and n_mpas > 0:
+        if intervention and cfg.mpa_redesign_enabled and n_mpas > 0 and cfg.government_mpa_push_max_pct > 0:
             lambda_t = management_quality * (cfg.government_mpa_push_max_pct / 100.0) * min(1.0, (t + 1) / 14.0)
-            global_exp = 1.0 + (cfg.government_mpa_push_max_pct / 100.0) * management_quality * (t / max(months - 1, 1)) * 0.45
+            global_exp = 1.0 + (cfg.government_mpa_push_max_pct / 100.0) * management_quality * min(1.0, t / max(cfg.policy_phase_in_months, 1)) * 0.45
             for k in range(n_mpas):
                 dlon_k = ((lon - base_cents[k, 0] + 180) % 360) - 180
                 dlat_k = lat - base_cents[k, 1]
@@ -289,11 +397,10 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                 fishers_near_mpas[k] = n_near_k
                 cong_near_k = float(np.sum(congestion * np.exp(-0.5 * dist_k_sq / (16.0**2))))
 
-                # REALISM INVARIANT: If there are NO fishers near this MPA, the MPA does NOT change!
-                # Marine sanctuaries with zero fishing activity remain anchored at baseline coordinates and baseline area.
-                if n_near_k == 0 and cong_near_k < 1e-4:
-                    curr_cents[k] = base_cents[k].copy()
-                    exp_k[k] = 1.0
+                # No local fleet presence: hold the previous legal boundary.
+                # Distant Gaussian congestion must not move an unthreatened reserve
+                # or teleport an already redesigned reserve back to its origin.
+                if n_near_k == 0:
                     continue
 
                 fisher_threat = min(1.0, max(n_near_k / 4.0, cong_near_k * 15.0, 0.20))
@@ -306,7 +413,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                     target_dlon = float(np.sum(reg_w * dlon_k) / sum_w)
                     target_dlat = float(np.sum(reg_w * dlat_k) / sum_w)
                     lat_dir = 1.0 if base_cents[k, 1] >= 0 else -1.0
-                    clim_drift = lat_dir * (clim * 4.5) * (0.2 + 0.8 * (t / max(months - 1, 1))) * fisher_threat
+                    clim_drift = lat_dir * (clim * 4.5) * (0.2 + 0.8 * min(1.0, t / max(cfg.policy_phase_in_months, 1))) * fisher_threat
                     c_target_lon = ((base_cents[k, 0] + target_dlon + 180) % 360) - 180
                     c_target_lat = float(np.clip(base_cents[k, 1] + target_dlat + clim_drift, -58, 58))
                     curr_cents[k, 0] = ((curr_cents[k, 0] + 0.22 * lambda_k * (((c_target_lon - curr_cents[k, 0] + 180) % 360) - 180) + 180) % 360) - 180
@@ -314,21 +421,13 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
         else:
             curr_cents = base_cents.copy()
             exp_k = np.ones(n_mpas, dtype=np.float32)
+        expansion_state = exp_k.copy()
 
-        # Coupled cell-level effective MPA layer and spillover buffer ring
-        dyn_cell_mpa = mpa.copy()
-        spillover_ring = np.zeros(G)
-        if n_mpas > 0:
-            for k in range(n_mpas):
-                r_k = max(base_radii[k] * exp_k[k], 2.5)
-                dlon_c = ((lon - curr_cents[k, 0] + 180) % 360) - 180
-                dlat_c = lat - curr_cents[k, 1]
-                dist_sq = (dlon_c**2 + dlat_c**2) / (r_k**2)
-                in_zone = np.exp(-0.5 * dist_sq)
-                ring_k = 4.0 * dist_sq * np.exp(-1.8 * dist_sq)
-                dyn_cell_mpa = np.maximum(dyn_cell_mpa, 0.55 * in_zone)
-                spillover_ring = np.maximum(spillover_ring, ring_k)
-        effective_mpa = np.clip(dyn_cell_mpa * (1 + gov_push), 0, 0.82)
+        # Exact transformed polygons are used for both exposure and the map.
+        frame_geometries = [_transform_mpa(feat["geometry"], base_cents[k], curr_cents[k], exp_k[k])
+                            for k,feat in enumerate(mpa_features)]
+        effective_mpa = (_polygon_exposure(frame_geometries, lon, lat) if n_mpas else
+                         np.clip(mpa * (1+gov_push), 0, .95))
 
         # EM effect is awareness-led and audit-enforced: EM vessels strongly avoid closed MPAs
         mgmt_gain=max(0.0,(management_quality-cfg.base_observability)/max(1.0-cfg.base_observability,0.01)) if intervention else 0.0
@@ -346,47 +445,21 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
         p_explore = np.where(explore_sum > 0, p_explore / np.maximum(explore_sum, 1e-9), 1.0 / G)
         p=(1-agents["exploration"][:,None])*p+agents["exploration"][:,None]*p_explore
         region=_sample_cat(p,rng)
+        # A frame is a monthly operating-ground observation, not a voyage waypoint.
+        # Catch, enforcement, habitat and the map all refer to this same cell.
         target_lon=lon[region]; target_lat=lat[region]
-        dlon_diff=((target_lon-curr_lon)+180)%360-180
-        dlat_diff=target_lat-curr_lat
-        dist=np.hypot(dlon_diff,dlat_diff)
-        stay=dist<3.0; move=~stay
-        if np.any(stay):
-            curr_lon[stay]+=rng.normal(0,0.45,np.sum(stay))
-            curr_lat[stay]+=rng.normal(0,0.35,np.sum(stay))
-        if np.any(move):
-            step_cap = np.where(agents["class"][move] >= 2, 12.0, 8.5)
-            step=np.minimum(dist[move], step_cap)
-            curr_lon[move]+=(dlon_diff[move]/dist[move])*step+rng.normal(0,0.3,np.sum(move))
-            curr_lat[move]+=(dlat_diff[move]/dist[move])*step+rng.normal(0,0.25,np.sum(move))
-        
-        # Biodiversity latitudinal limits per species
-        for i in range(n):
-            sp_i = agents["target_species"][i]
-            if sp_i == "YFT":
-                curr_lat[i] = np.clip(curr_lat[i], -35.0, 35.0)
-            elif sp_i == "BET":
-                curr_lat[i] = np.clip(curr_lat[i], -38.0, 38.0)
-            elif sp_i == "ALB":
-                curr_lat[i] = np.clip(curr_lat[i], -52.0, 52.0)
-            else:
-                curr_lat[i] = np.clip(curr_lat[i], -55.0, 55.0)
-        curr_lon=((curr_lon+180)%360)-180
-        if prep_land is not None and Point is not None:
-            for i in range(n):
-                if prep_land.contains(Point(float(curr_lon[i]), float(curr_lat[i]))):
-                    curr_lon[i]=target_lon[i]
-                    curr_lat[i]=target_lat[i]
+        travel_degrees = np.hypot(((target_lon-curr_lon+180)%360)-180, target_lat-curr_lat)
+        curr_lon = target_lon.copy().astype(float)
+        curr_lat = target_lat.copy().astype(float)
         prev_region=region
 
         encounter=rng.random(n)<np.clip(effective_mpa[region]*cfg.mpa_encounter_sensitivity,0,.95)
         # persistent latent non-compliance; EM affects awareness, government push affects norm pressure, surveillance deters violations.
-        norm_reduction=(cfg.enforcement_push_max_pct/100)*(t/max(months-1,1)) if intervention else 0.0
+        norm_reduction=(cfg.enforcement_push_max_pct/100)*min(1.0, t / max(cfg.policy_phase_in_months, 1)) if intervention else 0.0
         mgmt_deterrence=(1.0-0.65*mgmt_gain) if intervention else 1.0
-        # In unenforced paper parks (BAU), baseline violation probability is high (25-45% poaching);
-        # In EM, electronic video audits and tamper-proof GPS suppress violation propensity by ~90%.
-        basep=np.clip((cfg.baseline_violation_prob / 0.055) * (0.28 + 0.45 * agents["risk"]), cfg.minimum_residual_violation_prob, 0.70)
-        em_factor=np.where(em, 0.06 * (1.0 - aware_draw), 1.0)
+        # Awareness and enforcement independently reduce the configured propensity.
+        basep=np.clip(cfg.baseline_violation_prob * (0.75 + agents["risk"]), cfg.minimum_residual_violation_prob, 0.70)
+        em_factor=np.where(em, 1.0 - aware_draw, 1.0)
         violation_p=np.maximum(cfg.minimum_residual_violation_prob, basep * em_factor * (1.0 - 0.55 * norm_reduction) * mgmt_deterrence)
         # behavioural persistence: previous violations modestly raise next-month propensity.
         violation_p=np.clip(violation_p*(1+cfg.violation_persistence*np.minimum(cumulative_violation,3)/10),cfg.minimum_residual_violation_prob,.75)
@@ -394,28 +467,47 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
         cumulative_violation += illegal.astype(float)
         compliant_encounter=encounter&(~illegal)
         # govt reallocation support reduces displacement burden; stronger with intervention but stochastic.
-        realloc=(cfg.government_reallocation_support_max_pct/100)*(0.4+0.6*rng.random(n)) if intervention else 0
+        realloc=(cfg.government_reallocation_support_max_pct/100)*(0.4+0.6*rng_interv.random(n)) if (intervention and cfg.government_reallocation_support_max_pct > 0) else 0
         displacement_mult=1+compliant_encounter*(.18*(1-cfg.reallocation_cost_reduction*realloc))
 
         counts=np.bincount(region,weights=W,minlength=G)
         congestion=counts/max(counts.sum(),1)
         crowd=np.clip(1-.25*(congestion/np.maximum(effort_prior,.002)-1),.48,1.15)
-        effort=agents["effort"]*np.clip(.90+rng.lognormal(-.01,.10,n),.65,1.25)
+
+        # Dynamic bioeconomic effort feedback:
+        # In BAU: stock depletion forces vessels into wasteful search steaming and longer days at sea (effort creep)
+        # In EM: high observability (Q_t) cuts wasteful search steaming by 10-18%, and rebuilt CPUE allows vessels
+        # to achieve harvest allocations in fewer, more productive fishing days at sea.
+        target_res_mask = [world[f"suit_{k}"].values > 0.015 for k in ["YFT", "BET", "ALB", "SWO"]]
+        mean_target_stock = np.mean([np.mean(biomass[k][target_res_mask[idx]] / initial[k][target_res_mask[idx]]) for idx, k in enumerate(["YFT", "BET", "ALB", "SWO"]) if np.any(target_res_mask[idx])])
+        stock_depletion_creep = max(0.0, 1.0 - mean_target_stock) * 0.30 * (1.0 - 0.75 * adoption)
+        search_reduction = (0.16 * mgmt_gain * np.where(em, 1.0, 0.35)) if intervention else 0.0
+        effort_mult = np.clip((1.0 + stock_depletion_creep) * rng.lognormal(-0.5 * .06**2, .06, n), 0.75, 1.35)
+        stock_ratio = np.mean([biomass[c] / np.maximum(initial[c], 1e-12) for c in ["YFT", "BET", "ALB", "SWO"]], axis=0)
+        management_cap = np.clip(1 - cfg.management_response_strength * mgmt_gain * np.maximum(0, 1-stock_ratio[region]), 0.6, 1)
+        effort = agents["effort"] * effort_mult * management_cap
+        # Within coarse partially protected cells only the open fraction is fished.
+        # A compliant vessel encountering an entirely closed cell spends this month displaced.
+        access = np.where(compliant_encounter, 1-effective_mpa[region], 1.0)
 
         total_revenue=np.zeros(n); total_target=np.zeros(n); bycatch_events=np.zeros(n)
         species_month={}
         unmitigated_bycatch = {}
-        mgmt_price_boost = 1.0 + 0.16 * mgmt_gain if intervention else 0.94  # BAU unverified catch faces 6% market friction/IUU discount
+        removals = {}
+        # Both scenarios share the same exogenous nominal price path.
+        bau_friction = 0.0  # Trade sanctions require an explicit scenario, not an automatic BAU penalty.
+        market_friction = bau_friction * (1.0 - adoption)
+        mgmt_price_boost = 1.0 - market_friction
         for c,s in spp.items():
             # climate modifies abundance through habitat displacement and extremes.
-            clim_pen=np.exp(-s.climate_sensitivity*abs(clim))
+            clim_pen=np.exp(-s.climate_sensitivity * clim**2)
             lat_pref=np.exp(-0.5*((lat[region]-temp_lat_shift)/45)**2)
             suit_r=world[f"suit_{c}"].values[region]
             in_range=suit_r > 0.015
-            local_bio=np.where(in_range, np.maximum(biomass[c][region],.005)*clim_pen*(.75+.25*lat_pref), 0.0)
+            local_bio=np.where(in_range, biomass[c][region]*clim_pen*(.75+.25*lat_pref), 0.0)
             cpue=(local_bio**cfg.stock_cpue_elasticity)*crowd[region]
             noise=rng.lognormal(-.5*.35**2,.35,n)
-            base=scale*effort*agents["capacity"]*agents["catchability"]*cpue*noise
+            base=scale*effort*agents["capacity"]*agents["catchability"]*cpue*noise*access
             if s.bycatch:
                 # Coupled Bycatch Dynamics: EM adoption mandates & verifies circle hooks, bird-scaring lines, and de-hookers
                 mitig_eff = 0.45 if c == "SHK" else (0.58 if c == "TUR" else 0.54)
@@ -425,6 +517,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                 amount = unmit_amt * np.clip(mitigation, 0.35, 1.0)
                 # High-bycatch encounter events benchmarked against unmitigated gear threshold
                 unmit_thresh = np.quantile(unmit_amt[unmit_amt > 0], .75) if np.any(unmit_amt > 0) else 1e-4
+                amount, removals[c] = allocate_removals(amount, region, W, biomass[c], stock_units[c])
                 bycatch_events += (amount > unmit_thresh).astype(float)
                 species_month[c] = amount
                 unmitigated_bycatch[c] = unmit_amt
@@ -432,91 +525,67 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                 # species share from local regional suitability/biomass (strictly zero outside habitat)
                 share=np.where(in_range, suit_r, 0.0)
                 amount=base*share
-                # premium is random and only for EM/compliant vessels; management quality boosts certified price realization
-                eligible=em & (~illegal) if cfg.premium_requires_compliance else em
-                prem=np.where(eligible,premium_draw,0)
-                px=s.base_price_tonne*price_index*mgmt_price_boost*(1+prem)
+                amount, removals[c] = allocate_removals(amount, region, W, biomass[c], stock_units[c])
+                # Endogenous fish size / quality realization: healthy adult stocks command sashimi/export price,
+                # while depleted stocks suffer from growth-overfishing (small cannery-grade tunas).
+                stock_maturity = np.clip(0.85 + 0.15 * (local_bio / np.maximum(initial[c][region], 0.01)), 0.80, 1.15)
+                # premium is random and only for EM/compliant vessels; scales with supply-chain audit maturity
+                audit_maturity = min(1.0, (t + 1) / 12.0)
+                eligible = em if cfg.premium_requires_em else np.full(n, intervention, dtype=bool)
+                if cfg.premium_requires_compliance:
+                    eligible = eligible & (~illegal)
+                prem=np.where(eligible, premium_draw * audit_maturity, 0)
+                px=s.base_price_tonne*price_index*mgmt_price_boost*stock_maturity*(1+prem)
                 total_revenue += amount*px
                 total_target += amount
                 species_month[c]=amount
 
-        supply_ratio=max(float(np.sum(total_target*W))/max(prev_supply,1),.25)
+        supply_ratio=max(float(np.sum(total_target*W))/max(reference_supply,1),.25)
         total_revenue*=supply_ratio**(-cfg.demand_elasticity)
-        prev_supply=float(np.sum(total_target*W))
         # management observability improves search transit efficiency and reduces wasted steaming in EM;
-        # in BAU, stock depletion increases search steaming per tonne!
-        mean_target_stock = np.mean([np.mean(biomass[k]) for k in ["YFT", "BET", "ALB", "SWO"]])
-        stock_fuel_pen = (1.0 + 0.25 * max(0.0, 0.55 - mean_target_stock)) if not intervention else 1.0
-        search_reduction = (0.22 * mgmt_gain * np.where(em, 1.0, 0.25)) if intervention else 0.0
-        effective_displacement = displacement_mult * (1.0 - search_reduction) * stock_fuel_pen
+        # in BAU, stock depletion increases search steaming per tonne for unmonitored vessels
+        stock_fuel_pen = 1.0 + 0.25 * max(0.0, 0.55 - mean_target_stock) * (1.0 - 0.70 * adoption)
+        effective_displacement = displacement_mult * (1.0 - search_reduction) * stock_fuel_pen * (1 + travel_degrees / 360)
         fuel_l = effort * agents["fuel_lph"] * effective_displacement
         # Commercial longline operating costs reflect real-world cost structures (fuel, bait, food, crew)
-        op_cost = fuel_l * fuel_price + (agents["fixed"] * 1.35 + agents["crew"] * 1.25) / 12 + effort * 85
-        em_cost = np.where(em, cfg.em_capex_per_vessel / (cfg.em_amortization_years * 12) + cfg.em_service_annual / 12, 0)
-        # enforcement fine on detected illegal entries (catch forfeiture plus administrative penalty up to 125% revenue)
-        enforce_intensity = np.clip(0.40 + 0.60 * (management_quality / max(cfg.base_observability, 0.01)) * (1.0 + cfg.enforcement_push_max_pct / 100.0), 0.20, 1.25) if intervention else 0.20
+        cost_inflation = (1+cfg.annual_inflation_rate)**(year-1)
+        op_cost = fuel_l * fuel_price + ((agents["fixed"] + agents["crew"]) + effort * 85) * cost_inflation
+
+        # Operational fishing days & effort tracking
+        hours_per_day = np.array([12.0, 13.0, 14.0, 15.0])[agents["class"]]
+        vessel_fishing_days = np.minimum((effort / hours_per_day) * (0.80 + 0.20 * effective_displacement), 365.25/12)
+        month_fishing_days = float(np.sum(vessel_fishing_days * W))
+        month_effort_hours = float(np.sum(effort * W))
+        em_cost = np.where(em, cfg.em_capex_per_vessel / (cfg.em_amortization_years * 12) + cfg.em_service_annual * cost_inflation / 12, 0)
+        # enforcement fine on detected illegal entries (catch forfeiture plus administrative penalty)
+        enforce_intensity = np.clip(0.20 + (0.80 * mgmt_gain * (1.0 + cfg.enforcement_push_max_pct / 100.0) if intervention else 0.0), 0.20, 1.25)
         illegal_fine = np.where(illegal, total_revenue * enforce_intensity, 0.0)
         profit = total_revenue - op_cost - em_cost - illegal_fine
         profit_total+=profit; catch_total+=total_target; bycatch_total+=bycatch_events
 
-        # Coupled Non-Compliance Feedback on Reserve Efficacy (Paper-Park Leakage vs Enforced Sanctuary)
-        illegal_cell_effort = np.bincount(region, weights=illegal.astype(float) * effort * W, minlength=G)
-        total_cell_effort = np.bincount(region, weights=effort * W, minlength=G)
-        cell_illegal_rate = illegal_cell_effort / np.maximum(total_cell_effort, 1e-4)
-        # Rampant illegal poaching erodes nominal MPA protection from 0.80 down toward 0.15:
-        compliance_efficacy = np.clip(1.0 - 0.75 * cell_illegal_rate, 0.15, 1.0)
-        realized_cell_protection = 1.0 - 0.80 * effective_mpa * compliance_efficacy
-
-        # ecological update cell-by-cell/species-by-species (strictly regional resident dynamics)
-        for c,s in spp.items():
-            B=biomass[c]
-            suit_c=world[f"suit_{c}"].values
-            suit_mask=suit_c > 0.015
-            K=s.carrying_capacity*suit_c
-            growth=np.zeros(G)
-            growth[suit_mask]=(s.growth_rate/12)*B[suit_mask]*(1.0-B[suit_mask]/np.maximum(K[suit_mask],0.08))
-
-            # target harvest plus incidental bycatch pressure
-            hweights=species_month[c]*W
-            hcell=np.bincount(region,weights=hweights,minlength=G)
-            hshare=hcell/max(hcell.sum(),1) if hcell.sum()>0 else np.zeros(G)
-
-            if s.bycatch:
-                # BYCATCH FIX: Absolute physical extraction scales with fleet mitigation!
-                unmit_tot = float(np.sum(unmitigated_bycatch[c] * W))
-                mitig_tot = float(np.sum(species_month[c] * W))
-                bycatch_ratio = mitig_tot / max(unmit_tot, 1e-6)  # ~0.45-0.55 in EM vs 1.0 in BAU
-                f_rate = np.clip((cfg.harvest_pressure_scale / 12) * hshare * G * realized_cell_protection * bycatch_ratio * 0.75, 0.0, 0.25)
-            else:
-                # TARGET SPECIES: Open-access BAU has +15% overfishing effort creep; EM aligns with MSY
-                mgmt_effort_scale = (1.0 - 0.18 * mgmt_gain) if intervention else 1.15
-                f_rate = np.clip((cfg.harvest_pressure_scale / 12) * hshare * G * realized_cell_protection * mgmt_effort_scale, 0.0, 0.25)
-
-            harvest = f_rate * B
-            # migration towards neighbouring resident habitat via basin-average pull
-            if np.any(suit_mask):
-                meanB=float(np.average(B[suit_mask],weights=suit_c[suit_mask]))
-                migration=np.zeros(G)
-                migration[suit_mask]=(s.migration_strength/12)*(meanB-B[suit_mask])*suit_c[suit_mask]
-            else:
-                meanB=0.0
-                migration=np.zeros(G)
-            # Biological spillover: high-biomass protected sanctuaries export surplus to adjacent buffer cells
-            res_mask=(effective_mpa > 0.25) & suit_mask
-            res_B=float(np.mean(B[res_mask])) if np.any(res_mask) else meanB
-            spill_gain=(cfg.spillover_rate/12)*spillover_ring*max(0.0,res_B-meanB*0.85)*suit_c
-            spill_loss=(cfg.spillover_rate/12)*effective_mpa*0.35*B
-            basin_rebalance=(cfg.spillover_rate/24)*(meanB-B)*suit_c
-            extreme_loss=abs(clim)*s.climate_sensitivity*B/18
-            noise=np.where(suit_mask,rng_exo.normal(0,.006,G),0.0)
-            biomass[c]=np.where(
-                suit_mask,
-                np.clip(B+growth-harvest+migration+spill_gain-spill_loss+basin_rebalance-extreme_loss+noise,.001,np.maximum(K*1.35,0.05)),
-                0.0
-            )
+        # Physical stock balance: every landed tonne (or bycatch-index unit) is
+        # removed once. Protection acts through fishing access, never a second
+        # discount on already reported catch. Adjacent-cell exchange conserves stock.
+        for c, sp in spp.items():
+            B = biomass[c]
+            K = capacities[c]
+            extreme_loss = np.maximum(abs(clim) - 0.20, 0)**2 * sp.climate_sensitivity * B / 12
+            noise = rng_exo.normal(0, cfg.biological_noise_annual / np.sqrt(12), G) * B
+            after_extraction = monthly_stock_step(B, K, removals[c], sp.growth_rate,
+                                                 np.zeros(G), extreme_loss, noise)
+            # Exchange the remaining stock, so a harvested donor cannot export
+            # the same fish a second time. Receiver space is measured after growth.
+            exchange = conservative_exchange(after_extraction, K, stock_units[c], habitat_edges[c],
+                                            (sp.migration_strength + cfg.spillover_rate) / 12)
+            biomass[c] = after_extraction + exchange
 
         monthly_rows.append({"month_index":t,"year":year,"month":month+1,"scenario":"EM" if intervention else "BAU",
-            "landed_value":float(np.sum(total_revenue*W)),"fleet_profit":float(np.sum(profit*W)),"catch_tonnes":float(np.sum(total_target*W)),
+            "landed_value":float(np.sum(total_revenue*W)),
+            "real_landed_value":float(np.sum(total_revenue*W)) / (1+cfg.annual_inflation_rate)**(year-1),
+            "price_index":float(price_index),"supply_price_factor":float(supply_ratio**(-cfg.demand_elasticity)),"fleet_profit":float(np.sum(profit*W)),"catch_tonnes":float(np.sum(total_target*W)),
+            "stock_removals_tonnes":float(sum(np.sum(removals[c]*stock_units[c]) for c in codes if not spp[c].bycatch)),
+            "effort_hours":float(month_effort_hours),"fishing_days":float(month_fishing_days),
+            "revenue_per_day":float(np.sum(total_revenue*W)/max(month_fishing_days,1)),"catch_per_day":float(np.sum(total_target*W)/max(month_fishing_days,1)),
             "illegal_events":float(np.sum(illegal*W)),"bycatch_events":float(np.sum(bycatch_events*W)),"mpa_encounters":float(np.sum(encounter*W)),"em_share":float(np.average(em,weights=W)),
             "climate_index":float(clim),"fuel_price":float(fuel_price),"management_quality":float(management_quality)})
 
@@ -539,7 +608,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
             frame_lons, frame_lats, line_hovers = [], [], []
             cent_lons, cent_lats, cent_hovers = [], [], []
             for k, feat in enumerate(mpa_features):
-                geom_data = feat.get("geometry", {})
+                geom_data = frame_geometries[k]
                 props = feat.get("properties", {})
                 name = props.get("name", "MPA")
                 country = props.get("country", "N/A")
@@ -553,8 +622,8 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                 n_near = int(fishers_near_mpas[k])
 
                 if not intervention or n_near == 0 or shift_dist < 0.05:
-                    status_txt = "⚪ Static (No Local Fishing Threat)" if intervention else "⚪ Static MPA (BAU Twin)"
-                    cent_txt = f"{c_lat:.1f}°, {c_lon:.1f}° (baseline — no active fishers nearby)"
+                    status_txt = "⚪ Boundary held / no material centroid shift" if intervention else "⚪ Static MPA (BAU Twin)"
+                    cent_txt = f"{c_lat:.1f}°, {c_lon:.1f}°"
                 else:
                     status_txt = "🟢 Dynamic Coupled MPA (EM Twin)"
                     cent_txt = f"{c_lat:.1f}°, {c_lon:.1f}° (shifted {shift_dist:.1f}° responding to {n_near} active fishers)"
@@ -574,13 +643,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                         continue
                     ext_ring = poly[0]
                     for pt in ext_ring:
-                        nx = c_lon + (pt[0] - orig_lon) * exp_val
-                        ny = c_lat + (pt[1] - orig_lat) * exp_val
-                        nx = ((nx + 180) % 360) - 180
-                        ny = float(np.clip(ny, -60, 60))
-                        if prep_land and Point is not None and prep_land.contains(Point(nx, ny)):
-                            nx = c_lon + 0.6 * (nx - c_lon)
-                            ny = c_lat + 0.6 * (ny - c_lat)
+                        nx, ny = pt[0], pt[1]
                         frame_lons.append(nx)
                         frame_lats.append(ny)
                         line_hovers.append(dyn_ht)
@@ -603,7 +666,7 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
             obs_target=cfg.base_observability+(cfg.em_observability_gain*adoption if intervention else 0)
             management_quality=(1-cfg.management_learning_rate)*management_quality+cfg.management_learning_rate*np.clip(obs_target,0,1)
             # govt creates/expands protection where resident target biomass is weak and effort is high.
-            if intervention and cfg.mpa_redesign_enabled:
+            if intervention and cfg.mpa_redesign_enabled and not n_mpas:
                 weakness=np.zeros(G)
                 for c in ["YFT","BET","ALB","SWO"]:
                     suit_c = world[f"suit_{c}"].values
@@ -615,16 +678,21 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
                     mpa += (cfg.government_mpa_push_max_pct/100)*management_quality*(score/score.max())*.025
                     mpa=np.clip(mpa,0,.65)
             ar={"year":year,"scenario":"EM" if intervention else "BAU",
-                "landed_value":sum(x["landed_value"] for x in monthly_rows[-12:]),"fleet_profit":sum(x["fleet_profit"] for x in monthly_rows[-12:]),
-                "catch_tonnes":sum(x["catch_tonnes"] for x in monthly_rows[-12:]),"illegal_events":sum(x["illegal_events"] for x in monthly_rows[-12:]),
+                "landed_value":sum(x["landed_value"] for x in monthly_rows[-12:]),
+                "real_landed_value":sum(x["real_landed_value"] for x in monthly_rows[-12:]),"fleet_profit":sum(x["fleet_profit"] for x in monthly_rows[-12:]),
+                "catch_tonnes":sum(x["catch_tonnes"] for x in monthly_rows[-12:]),
+                "effort_hours":sum(x["effort_hours"] for x in monthly_rows[-12:]),"fishing_days":sum(x["fishing_days"] for x in monthly_rows[-12:]),
+                "revenue_per_day":sum(x["landed_value"] for x in monthly_rows[-12:])/max(sum(x["fishing_days"] for x in monthly_rows[-12:]),1),
+                "catch_per_day":sum(x["catch_tonnes"] for x in monthly_rows[-12:])/max(sum(x["fishing_days"] for x in monthly_rows[-12:]),1),
+                "illegal_events":sum(x["illegal_events"] for x in monthly_rows[-12:]),
                 "bycatch_events":sum(x.get("bycatch_events",0.0) for x in monthly_rows[-12:]),
-                "mpa_share":float(np.average(mpa,weights=effort_prior)),"management_quality":float(management_quality),"climate_extreme":float(np.max(np.abs(climate[max(0,t-11):t+1])))}
+                "mpa_share":float(np.average(effective_mpa,weights=effort_prior)),"management_quality":float(management_quality),"climate_extreme":float(np.max(np.abs(climate[max(0,t-11):t+1])))}
             annual_rows.append(ar)
             for c,s in spp.items():
                 suit_c = world[f"suit_{c}"].values
                 suit_mask = suit_c > 0.015
                 if np.any(suit_mask):
-                    ratio = float(np.average(biomass[c][suit_mask] / np.maximum(initial[c][suit_mask], 1e-4), weights=suit_c[suit_mask]))
+                    ratio = float(np.sum(biomass[c]*stock_units[c]) / max(np.sum(initial[c]*stock_units[c]), 1e-12))
                 else:
                     ratio = 1.0
                 status="Healthy" if ratio>=.8 else "Stressed" if ratio>=.5 else "Depleted" if ratio>=cfg.severe_depletion_threshold else "Severely depleted" if ratio>=cfg.local_extirpation_threshold else "Local functional extinction risk"
@@ -639,6 +707,14 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
     cls_names=np.array(["Small coastal","Medium regional","Large industrial","Distant-water freezer"],object)
     vessel_summary=pd.DataFrame({"class":cls_names[agents["class"]],"weight":W,"em":em,"profit_total":profit_total,"catch_total":catch_total,"bycatch_total":bycatch_total,"violations":cumulative_violation})
     meta = {
+        "monetary_basis": "nominal USD; real_landed_value is deflated to simulation year 1",
+        "model_version": "coupled-stock-v3",
+        "mpa_exposure_basis": "polygon membership at monthly fishing cell" if n_mpas else "coarse cell protection fraction",
+        "reference_supply_tonnes_month": reference_supply,
+        "stock_units": stock_units,
+        "initial_biomass": initial,
+        "capacities": capacities,
+        "calibration_factor": _calibration_factor,
         "realized_em_share": float(np.average(em, weights=W)),
         "climate_min": float(climate.min()),
         "climate_max": float(climate.max()),
@@ -650,10 +726,11 @@ def simulate_global(cfg: GlobalSimulationConfig, world: pd.DataFrame, interventi
 
 def run_paired_global(cfg, world, animation_agents=500, step_callback=None):
     bau = simulate_global(cfg, world, False, animation_agents)
-    
+
     def on_em_annual(yr, total_yrs, ann_rows, mon_rows, spp_rows, is_interv):
         if step_callback is not None:
             step_callback(yr, total_yrs, bau, ann_rows, mon_rows, spp_rows)
-            
-    em = simulate_global(cfg, world, True, animation_agents, step_callback=on_em_annual if step_callback else None)
+
+    em = simulate_global(cfg, world, True, animation_agents, step_callback=on_em_annual if step_callback else None,
+                         _calibration_factor=bau.meta["calibration_factor"])
     return {"BAU": bau, "EM": em}

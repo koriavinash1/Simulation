@@ -29,65 +29,16 @@ In the simulator, species habitat suitability $S_{sg} \in [0, 1]$ is calibrated 
 
 ---
 
-## 3. Mathematical Population Formulations
+## 3. Current stock accounting
 
-### Spatial Carrying Capacity
-Carrying capacity scales strictly with regional suitability:
+See [MODEL_CORRECTIONS.md](MODEL_CORRECTIONS.md) for the current physical equations and calibration. In resident cells, capacity is `K = species_capacity * suitability` and initial global stock is `0.70 K`. Elsewhere both are zero. Growth is net logistic surplus production `r/12 * B * (1-B/K)` without an artificial denominator floor or additional natural mortality subtraction.
 
-$$
-K_{sg} = K_{0, s} \cdot S_{sg}
-$$
+Fixed cell-specific stock units convert actual weighted catch to stock-index removals. Catch is proportionally capped at available biomass before either sales or removals. Every recorded landed tonne removes the same tonne from the stock ledger. EM gear mitigation reduces bycatch before this accounting step. Protection acts through access, not a second discount on reported extraction.
 
-For cells outside species habitat ($S_{sg} \le 0.015$), $K_{sg} = 0.0$ and standing biomass $B_{sgt} = 0.0$.
+Physical biomass moves conservatively between adjacent resident cells along differences in `B/K`. Transfers debit donors and credit receivers equally. There are no independent basin-pull or spillover-creation terms. Final stock lies in `[0,K]`; a zero population cannot spontaneously regrow without incoming migration. Environmental noise is proportional to stock, and extreme climate mortality follows the scenario specification in the correction document.
 
-### Monthly Logistic Surplus Production
-Within resident cells ($S_{sg} > 0.015$), surplus biological growth follows the Schaefer model:
+## 4. Ecological indicators
 
-$$
-\text{Growth}_{sgt} = \frac{r_s}{12} B_{sgt} \left(1.0 - \frac{B_{sgt}}{\max(K_{sg}, 0.08)}\right)
-$$
+The global population ratio is total physical stock divided by its initial total, using the fixed stock-unit conversion. Status labels are scenario indicators, not IUCN classifications: healthy at 0.80 or above, stressed at 0.50–0.80, depleted down to the configured severe-depletion threshold, and severely depleted down to the functional-extirpation threshold.
 
-### Target Harvest & Bycatch Extractions
-Vessel catch share is determined by local species abundance and regional suitability:
-
-$$
-\text{Share}_{sg} = \begin{cases} S_{sg} & \text{if } S_{sg} > 0.015 \\ 0.0 & \text{otherwise} \end{cases}
-$$
-
-$$
-\text{Harvest}_{sgt} = \left(\frac{\text{scale}_{\text{harv}}}{12}\right) \cdot \left(\frac{\sum_{i \in g} C_{isgt} W_i}{\sum_h \sum_{i \in h} C_{isgt} W_i}\right) \cdot G \cdot \text{realized\_cell\_protection}(g, t)
-$$
-
-For incidental bycatch species (`SHK`, `TUR`, `SEA`), harvest is scaled by $0.45 \cdot \text{Harvest}_{sgt}$.
-
-### Resident Basin Migration & Biological Spillover
-- **Basin Equilibrium Pull:**
-  $$
-  \text{Migration}_{sgt} = \frac{m_s}{12} \left(\bar{B}_{s, \text{resident}} - B_{sgt}\right) \cdot S_{sg}
-  $$
-- **Sanctuary Spillover Export:**
-  $$
-  \text{SpillGain}_{sgt} = \frac{S_{\text{rate}}}{12} \cdot \text{Ring}(g) \cdot \max\left(0, \bar{B}_{s, \text{reserves}} - 0.85 \bar{B}_{s, \text{resident}}\right) \cdot S_{sg}
-  $$
-- **Sanctuary Biomass Export Loss:**
-  $$
-  \text{SpillLoss}_{sgt} = \frac{S_{\text{rate}}}{12} \cdot \text{effective\_mpa}(g, t) \cdot 0.35 \cdot B_{sgt}
-  $$
-
----
-
-## 4. Coupled Ecological Indicators
-
-### Species Population Health Index
-The annual species health ratio is averaged strictly across resident habitat cells ($S_{sg} > 0.015$):
-
-$$
-\text{Ratio}_s(y) = \frac{\sum_{g \in \text{resident}} B_{sg}(y)}{\sum_{g \in \text{resident}} B_{sg0}}
-$$
-
-Status categories:
-- $\text{Ratio} \ge 0.80$: **Healthy**
-- $0.50 \le \text{Ratio} < 0.80$: **Stressed**
-- $\text{threshold}_{\text{dep}} \le \text{Ratio} < 0.50$: **Depleted**
-- $\text{threshold}_{\text{ext}} \le \text{Ratio} < \text{threshold}_{\text{dep}}$: **Severely depleted**
-- $\text{Ratio} < \text{threshold}_{\text{ext}}$: **Local functional extinction risk**
+Bycatch quantities and encounter thresholds remain synthetic indices rather than calibrated animal mortality counts. Habitat adjacency, growth and biomass conversions require fishery-specific validation.

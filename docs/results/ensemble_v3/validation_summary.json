@@ -1,0 +1,12 @@
+{
+  "default_pair_count": 30,
+  "zero_identity_pass_count": 10,
+  "zero_identity_count": 10,
+  "max_zero_monthly_difference": 0.0,
+  "max_baseline_anchor_error_usd": 9.5367431640625e-07,
+  "max_stock_ledger_error_tonnes": 2.9103830456733704e-11,
+  "final_profitable_seed_count": {
+    "BAU": 7,
+    "EM": 22
+  }
+}

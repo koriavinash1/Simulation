@@ -9,7 +9,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from sim.global_config import GlobalSimulationConfig
+from sim.market import HISTORICAL_NOMINAL_VALUE_CAGR, nominal_price_growth
+from sim.config import GlobalSimulationConfig
 from sim.global_data import load_world, load_mpas, get_frame_mpas
 from sim.global_engine import run_paired_global, _get_prep_land
 from sim.dynamics_visualizer import render_dynamics_frame, create_simulation_gif, generate_gif_from_results
@@ -72,14 +73,27 @@ with st.sidebar:
     st.divider()
     st.subheader("EM intervention")
     adoption=st.slider("Maximum EM adoption (%)",0,100,75,5,help="Upper adoption tendency. Installation is randomized across agents; realised coverage will differ slightly.")
+    awareness=st.slider("EM awareness & education effect (%)",0,100,75,5,help="Training and awareness raising reducing unintentional non-compliance.")
     premium=st.slider("Maximum verified premium (%)",0,20,10,1,help="Premium ceiling only. Each eligible EM vessel draws a different premium; many receive little or none.")
     st.divider()
     st.subheader("Government / management")
     mpa_push=st.slider("Maximum MPA expansion / redesign push (%)",0,50,25,5,help="Maximum policy pressure to expand/re-target protection toward stressed, high-pressure cells.")
+    realloc=st.slider("Maximum reallocation support (%)",0,100,30,5,help="Reduces displacement costs. Set all intervention controls to zero for identical BAU and EM worlds.")
     enforcement=st.slider("Maximum general compliance push (%)",0,60,30,5,help="Norm/enforcement pressure affecting all vessels. It reduces but never eliminates illegal entry.")
     st.divider()
     st.subheader("Climate")
     climate=st.slider("Climate extremity ceiling (%)",0,80,35,5,help="You specify only the maximum extremity. Timing, direction, duration and shocks are randomized by the simulation.")
+    st.divider()
+    st.subheader("Shared market scenario")
+    market_scenario=st.selectbox("Price growth basis",["Positive real growth (planning assumption)","Historical nominal proxy (comparison)"])
+    inflation_pct=st.number_input("Assumed annual inflation (%)",min_value=0.0,max_value=15.0,value=2.2,step=0.1)
+    if market_scenario.startswith("Positive"):
+        real_growth_pct=st.number_input("Real annual price growth (%)",min_value=-5.0,max_value=5.0,value=1.5,step=0.25,
+            help="Planning assumption shared by BAU and EM. Real revenue also responds to catch and stock quality.")
+        nominal_drift=nominal_price_growth(real_growth_pct/100,inflation_pct/100)
+    else:
+        nominal_drift=HISTORICAL_NOMINAL_VALUE_CAGR
+    st.caption(f"Nominal price growth: {nominal_drift*100:.2f}%/yr; implied real price growth: {((1+nominal_drift)/(1+inflation_pct/100)-1)*100:.2f}%/yr.")
     st.divider()
     st.subheader("Runtime")
     reps=st.select_slider("Representative vessel agents",options=[500,1000,1500,2500,4000,7288],value=1500,help="Agents are weighted to represent the full registered longliner fleet. Use 7,288 for one agent per vessel.")
@@ -87,15 +101,15 @@ with st.sidebar:
     frame_step=st.select_slider("Animation frame interval",options=[1,2,3,6,12],value=3,format_func=lambda x:f"{x} month(s)")
 
 cfg=GlobalSimulationConfig(years=years,seed=int(seed),representative_agents=int(reps),months_per_frame=int(frame_step),
-    em_adoption_max_pct=float(adoption),premium_max_pct=float(premium),
+    em_adoption_max_pct=float(adoption),em_awareness_effect_max_pct=float(awareness),premium_max_pct=float(premium),
     climate_extremity_max_pct=float(climate),government_mpa_push_max_pct=float(mpa_push),
-    enforcement_push_max_pct=float(enforcement))
+    enforcement_push_max_pct=float(enforcement),government_reallocation_support_max_pct=float(realloc),annual_price_drift=float(nominal_drift),annual_inflation_rate=float(inflation_pct/100))
 
 # Data provenance banner
 c1,c2,c3=st.columns(3)
 c1.info(f"**World cells:** {world_source}\n\n{len(world):,} verified pelagic ocean cells (zero land)")
 c2.info(f"**MPA boundaries:** {'15 major pelagic reserves loaded (WDPA / MPAtlas / UNEP-WCMC)' if mpa_path else 'coarse MPA exposure priors used'}")
-c3.info("**Baseline landed value:** $6.0B global longline anchor calibrated from FAO / World Bank fisheries statistics.")
+c3.info("**Baseline landed value:** $6.0B nominal scenario anchor. Price growth is a shared scenario assumption; the historical proxy remains available for comparison.")
 
 with st.expander("What is reference-calibrated vs user-controlled?",expanded=False):
     st.markdown(doc("PARAMETER_REFERENCES.md"))
@@ -107,27 +121,27 @@ if st.button("Run paired BAU vs EM digital twin", type="primary", width="stretch
         progress_bar = st.progress(0.0)
         status_box = st.empty()
         graph_box = st.empty()
-        
+
         frames_list = []
         status_box.info("⚙️ Step 1/2: Simulating baseline Business-As-Usual (BAU) world...")
-        
+
         def on_step(yr, total_yrs, bau_res, em_ann, em_mon, em_spp):
             pct = float(yr) / float(total_yrs)
             progress_bar.progress(pct)
-            
+
             e_df = pd.DataFrame(em_ann)
             b_df = bau_res.annual[bau_res.annual["year"] <= yr]
             land_div = (e_df["landed_value"].iloc[-1] - b_df["landed_value"].iloc[-1]) / 1e6 if not e_df.empty and not b_df.empty else 0.0
             cum_prof_div = (e_df["fleet_profit"].sum() - b_df["fleet_profit"].sum()) / 1e6 if not e_df.empty and not b_df.empty else 0.0
             ilg_supp = 100.0 * (b_df["illegal_events"].iloc[-1] - e_df["illegal_events"].iloc[-1]) / max(b_df["illegal_events"].iloc[-1], 1) if not e_df.empty and not b_df.empty else 0.0
-            
+
             status_box.markdown(
                 f"**🌊 Step 2/2: Simulating EM Intervention — Year {yr}/{total_yrs}** | "
                 f"💰 Landed Value Div: **+${land_div:,.1f}M** | "
                 f"📈 Cumulative Profit Div: **+${cum_prof_div:,.1f}M** | "
                 f"🛡️ Poaching Suppressed: **-{ilg_supp:.1f}%**"
             )
-            
+
             frame_img = render_dynamics_frame(
                 year=yr,
                 total_years=total_yrs,
@@ -138,10 +152,10 @@ if st.button("Run paired BAU vs EM digital twin", type="primary", width="stretch
                 cfg=cfg
             )
             frames_list.append(frame_img)
-            graph_box.image(frame_img, use_container_width=True)
-            
+            graph_box.image(frame_img, width="stretch")
+
         res_paired = run_paired_global(cfg, world, int(anim_agents), step_callback=on_step)
-        
+
         # Save GIF at end of simulation
         status_box.info("🎬 Compiling 15-Year Dynamical Systems Animation GIF...")
         if frames_list:
@@ -149,7 +163,7 @@ if st.button("Run paired BAU vs EM digital twin", type="primary", width="stretch
             gif_path = DATA / "simulation_dynamics.gif"
             create_simulation_gif(frames_list, gif_path, duration_ms=400)
             st.session_state["simulation_gif_path"] = str(gif_path)
-            
+
             # Also save to artifact directory if available
             art_dir = Path("/Users/agk/.gemini/antigravity-ide/brain/3d46a445-b1b5-40d7-8919-3946baa50abd")
             if art_dir.exists():
@@ -157,11 +171,14 @@ if st.button("Run paired BAU vs EM digital twin", type="primary", width="stretch
                     create_simulation_gif(frames_list, art_dir / "simulation_dynamics.gif", duration_ms=400)
                 except Exception:
                     pass
-            
+
         progress_bar.progress(1.0)
         status_box.success("✅ Coupled Dynamical Systems Simulation Completed! 15-Year Evolution GIF Saved.")
         st.session_state["global_result"] = res_paired
         st.session_state["global_cfg"] = cfg
+
+if "global_result" in st.session_state and st.session_state["global_result"]["BAU"].meta.get("model_version") != "coupled-stock-v3":
+    del st.session_state["global_result"]
 
 if "global_result" not in st.session_state:
     st.info("Run the simulator to generate the paired worlds. The BAU and EM scenarios share the same initial fleet and stochastic climate path; only intervention mechanisms differ.")
@@ -187,16 +204,16 @@ cols[4].metric("Effective MPA share",f"{e_last.mpa_share*100:.1f}%",f"{(e_last.m
 # Executive Benefit Highlights Banner
 st.success(
     f"💡 **Key Takeaways & Core Reform Dividends (EM Intervention vs. BAU Baseline across {cfg.years} Years):**\n\n"
-    f"- 💰 **Landed Value Expansion:** **{money(cum_land_div)}** cumulative gross revenue gain ({100*cum_land_div/max(abs(tot_bau_land),1):+.1f}% vs BAU) driven by certified export price premiums and 8–18% search transit fuel savings.\n"
-    f"- 🛡️ **Poaching & 'Paper Park' Eradication:** Non-compliant incursions cut by **{100*(b_last.illegal_events-e_last.illegal_events)/max(b_last.illegal_events,1):.1f}%**, transforming paper parks into active biological safe havens.\n"
-    f"- 🐬 **Megafauna Bycatch Protection:** Shark, turtle, and seabird mortality reduced by **{100*(b_last.bycatch_events-e_last.bycatch_events)/max(b_last.bycatch_events,1):.1f}%** via certified circle hooks and tori lines.\n"
-    f"- 📈 **World Bank Macroeconomic Realism:** Wild marine capture revenue grows at **1.08%–1.10% annual real rate** (matching World Bank *Fish to 2030*), expanding to **~3.3% nominal rate** under baseline global inflation."
+    f"- 💰 **Landed value difference:** **{money(cum_land_div)}** cumulative gross revenue difference ({100*cum_land_div/max(abs(tot_bau_land),1):+.1f}% vs BAU) from modeled catch and price changes.\n"
+    f"- 🛡️ **Non-compliant MPA events:** Non-compliant incursions cut by **{100*(b_last.illegal_events-e_last.illegal_events)/max(b_last.illegal_events,1):.1f}%** under this scenario.\n"
+    f"- 🐬 **Megafauna Bycatch Protection:** Synthetic high-bycatch encounter events reduced by **{100*(b_last.bycatch_events-e_last.bycatch_events)/max(b_last.bycatch_events,1):.1f}%** via certified circle hooks and tori lines.\n"
+    f"- 📈 **Selected market assumption:** Nominal prices follow a **{cfg.annual_price_drift*100:.2f}%/yr** trend. Implied real price growth is **{((1+cfg.annual_price_drift)/(1+cfg.annual_inflation_rate)-1)*100:.2f}%/yr**. Revenue also depends on catch."
 )
 
 with st.expander("⚙️ Coupled System Transmission: How Current Scenario Inputs Drive the Model", expanded=False):
-    st.caption("Every input configuration from the sidebar is directly and bidirectionally coupled into the mathematical simulation:")
+    st.caption("Policy controls enter the indicated feedback channels; climate follows a shared exogenous process:")
     s1, s2, s3, s4, s5 = st.columns(5)
-    s1.markdown(f"**📡 EM Adoption: {cfg.em_adoption_max_pct:.0f}%**\n- Realized coverage: **{em.meta['realized_em_share']*100:.1f}%**\n- Eliminates equipped poaching\n- Enforces circle hooks & tori lines\n- Drives management $Q_t$ gain")
+    s1.markdown(f"**📡 EM Adoption: {cfg.em_adoption_max_pct:.0f}%**\n- Realized coverage: **{em.meta['realized_em_share']*100:.1f}%**\n- Reduces non-compliance propensity\n- Enforces circle hooks & tori lines\n- Drives management $Q_t$ gain")
     s2.markdown(f"**🏷️ Verified Premium: +{cfg.premium_max_pct:.0f}%**\n- Ex-vessel certified export price\n- Paid only on compliant catches\n- Generates cumulative reform dividend")
     s3.markdown(rf"**🛡️ Dynamic MPA Push: {cfg.government_mpa_push_max_pct:.0f}%**\n- Centroids track depleted $\Psi(g,t)$\n- Expansion up to **+{cfg.government_mpa_push_max_pct*0.45:.1f}%**\n- Multiplies sanctuary protection")
     s4.markdown(f"**🚨 Compliance Push: {cfg.enforcement_push_max_pct:.0f}%**\n- Fines scale to **{1.0 + cfg.enforcement_push_max_pct/100:.2f}x**\n- Suppresses paper-park poaching\n- Safeguards legal fishers' rents")
@@ -215,7 +232,7 @@ if gif_file.exists():
     with st.expander("🎬 Dynamical Systems Evolution (Animated Multi-Panel GIF & Download)", expanded=True):
         g_c1, g_c2 = st.columns([3.6, 1.4])
         with g_c1:
-            st.image(str(gif_file), caption=f"🎬 Coupled Dynamical Systems Trajectory across {cfg.years} Years (BAU Baseline vs. EM Intervention)", use_container_width=True)
+            st.image(str(gif_file), caption=f"🎬 Coupled Dynamical Systems Trajectory across {cfg.years} Years (BAU Baseline vs. EM Intervention)", width="stretch")
         with g_c2:
             st.markdown("#### 📥 Export Dynamics GIF")
             st.caption("The simulation solves 5 coupled dynamical ODE systems over time. Download this animated GIF for presentations, papers, and executive briefings.")
@@ -226,7 +243,7 @@ if gif_file.exists():
                     file_name=f"simulation_dynamics_{cfg.years}yr.gif",
                     mime="image/gif",
                     type="primary",
-                    use_container_width=True
+                    width="stretch"
                 )
             st.markdown(
                 "**Dynamical Panels Captured:**\n"
@@ -625,24 +642,24 @@ with tabs[0]:
     with st.expander("🔬 Execution Pipeline: What happens when you click 'Run simulation'?", expanded=False):
         st.markdown("""
         **Every run executes the full mathematical system live in memory—not a pre-saved playback:**
-        
+
         1. **Paired Twin Initialization:**
            - The simulation instantiates thousands of synthetic longliner agents across four vessel size classes, drawn from calibrated FAO/GFW distributions (effort, fuel burn, catchability, risk tolerance).
            - Both twins (BAU and EM) share the identical random seed, baseline world cells, initial commercial biomass, and stochastic climate shock path ($c_t$).
-        
+
         2. **Monthly Agent Utility & Ground Choice:**
            - For each agent $i$ and cell $g$, multinomial logit choice utility $U_{igt} = \\log H_{ig} + 0.82 \\log B_{gt} + 0.65 I(g = g_{t-1}) - A_i \\cdot \\text{effective\\_mpa}_{gt}$ is computed.
            - Vessels dynamically sample grounds. Crowding $K_{igt}$ penalizes catch efficiency in congested cells.
-        
+
         3. **Catch, Economics & Biological Stock Harvest:**
            - Catch is harvested from local species abundance: $C_{isgt} = q_i E_{it} B_{sgt}^{\\eta_B} K_{igt} \\epsilon_{it} S_{sg}$.
            - Operating costs, fuel burn, EM fees, and surveillance fines are deducted to generate net vessel profit.
            - Stocks grow via logistic growth, are reduced by harvest, migrate poleward with climate drift, and spill over from dynamic MPAs into adjacent buffer zones.
-        
+
         4. **Endogenous Conservation Priority & Dynamic MPA Demarcation:**
            - The Conservation Priority Field $\\Psi(g, t) = \\text{Depletion}(g, t) \\cdot (0.35 + 0.65 \\text{Congestion}) + 0.35 \\text{BycatchRisk}$ updates endogenously.
            - Reserve centroids $\\vec{C}_k(t)$ dynamically track the center-of-gravity of $\\Psi(g, t)$ and expand under management policy push.
-        
+
         5. **Exact GeoJSON Rendering in Animation:**
            - The animation displays the exact agent positions, monthly catch amounts, profits, and polygon geometries generated by this month-by-month execution.
         """)
@@ -668,19 +685,19 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Economic Footprint & Fisheries Reform Dividend")
-    
-    # Macroeconomic & Policy Context Banner
-    st.info(
-        "📊 **World Bank Macroeconomic Benchmark (*Fish to 2030* & *The Sunken Billions Revisited*):**\n\n"
-        "- **Supply Inelasticity:** Global wild capture fisheries landings have structurally plateaued at ~85–93 Mt, capped by Maximum Sustainable Yield (MSY).\n"
-        "- **Demand-Driven Real Price Appreciation:** Population growth and rapid middle-class disposable income growth drive seafood demand higher (+1.5%–2.1% p.a.), generating **1.0% to 2.0% annual real revenue growth**.\n"
-        "- **Inflation Adjustment:** With baseline global commodity inflation modeled at **2.2% annually**, nominal commercial turnover expands at **3.0% to 4.5% per year**."
-    )
 
-    # Core Headline Metrics
-    ec1, ec2, ec3, ec4 = st.columns(4)
-    ec1.metric("Cumulative Landed Value Div", money(cum_land_div), f"{100*cum_land_div/max(abs(tot_bau_land),1):+.1f}% vs BAU")
-    ec2.metric("Cumulative Fleet Profit Div", money(cum_prof_div), f"{100*cum_prof_div/max(abs(tot_bau_prof),1):+.1f}% vs BAU")
+    st.info(
+        "**Historical capture-fisheries context:** FAO reports about $151B in 2018, $141B in 2020, and $159B in 2022 in global first-sale values. "
+        "The endpoint trend is approximately 1.3% per year in nominal USD, with a substantial pandemic-period decline. "
+        "This is a broad capture-fisheries proxy, not a longline price estimate or a guaranteed revenue growth rate. "
+        "[FAO 2020](https://doi.org/10.4060/ca9229en), "
+        "[FAO 2022](https://www.fao.org/4/cc0461en/online/sofia/2022/world-fisheries-aquaculture.html), "
+        "[FAO 2024](https://doi.org/10.4060/cd0683en). "
+        "The default planning scenario instead assumes 1.5% annual real price growth; with 2.2% inflation this composes to 3.733% nominal growth. "
+        "This positive-real-growth scenario is an explicit assumption, not a historical estimate. "
+        "The sidebar retains the historical nominal proxy for comparison. All revenue charts use nominal USD; inflation-adjusted growth is shown separately. "
+        "Set adoption, awareness, premium, MPA push, compliance push and reallocation support to zero for identical paired curves."
+    )
 
     # Compute year-by-year series
     bau_ann = bau.annual
@@ -691,21 +708,39 @@ with tabs[2]:
     landed_div_M = (em_ann["landed_value"].values - bau_ann["landed_value"].values) / 1e6
     profit_div_M = (em_ann["fleet_profit"].values - bau_ann["fleet_profit"].values) / 1e6
 
-    inflation = getattr(cfg, "annual_inflation_rate", 0.022)
-    bau_real_yoy = [0.0] + [((bau_rev[i]/bau_rev[i-1]) - 1.0)*100.0 for i in range(1, len(bau_rev))]
-    em_real_yoy = [0.0] + [((em_rev[i]/em_rev[i-1]) - 1.0)*100.0 for i in range(1, len(em_rev))]
+    # Operational fishing days & daily realization
+    bau_days = bau_ann["fishing_days"].values / 1e6 if "fishing_days" in bau_ann.columns else (bau_rev * 1e9 / 3500) / 1e6
+    em_days = em_ann["fishing_days"].values / 1e6 if "fishing_days" in em_ann.columns else (em_rev * 1e9 / 4000) / 1e6
+    days_saved_k = (bau_days - em_days) * 1e3  # in thousands of days
+    cum_days_saved = float(np.sum((bau_days - em_days) * 1e6))
 
-    bau_nom_yoy = [0.0] + [(((1.0 + r/100.0)*(1.0 + inflation)) - 1.0)*100.0 for r in bau_real_yoy[1:]]
-    em_nom_yoy = [0.0] + [(((1.0 + r/100.0)*(1.0 + inflation)) - 1.0)*100.0 for r in em_real_yoy[1:]]
+    bau_rpd = bau_ann["revenue_per_day"].values if "revenue_per_day" in bau_ann.columns else (bau_rev * 1e9 / (bau_days * 1e6))
+    em_rpd = em_ann["revenue_per_day"].values if "revenue_per_day" in em_ann.columns else (em_rev * 1e9 / (em_days * 1e6))
+    mean_rpd_gain = float(np.mean(em_rpd - bau_rpd))
+    pct_rpd_gain = (float(np.mean(em_rpd)) / max(float(np.mean(bau_rpd)), 1) - 1.0) * 100.0
+
+    inflation = getattr(cfg, "annual_inflation_rate", 0.022)
+    bau_nom_yoy = [0.0] + [((bau_rev[i]/bau_rev[i-1])-1)*100 for i in range(1,len(bau_rev))]
+    em_nom_yoy = [0.0] + [((em_rev[i]/em_rev[i-1])-1)*100 for i in range(1,len(em_rev))]
+    bau_real_yoy = [0.0] + [((1+r/100)/(1+inflation)-1)*100 for r in bau_nom_yoy[1:]]
+    em_real_yoy = [0.0] + [((1+r/100)/(1+inflation)-1)*100 for r in em_nom_yoy[1:]]
 
     mean_bau_real = float(np.mean(bau_real_yoy[1:])) if len(bau_real_yoy) > 1 else 0.0
     mean_em_real = float(np.mean(em_real_yoy[1:])) if len(em_real_yoy) > 1 else 0.0
     mean_em_nom = float(np.mean(em_nom_yoy[1:])) if len(em_nom_yoy) > 1 else 0.0
 
-    ec3.metric("Mean Real YoY Growth (EM)", f"{mean_em_real:+.2f}% / yr", "World Bank: 1.0%–2.0%")
-    ec4.metric("Mean Nominal YoY Growth (EM)", f"{mean_em_nom:+.2f}% / yr", f"Global Inflation: {inflation*100:.1f}%")
+    # Core Headline Metrics
+    ec1, ec2, ec3, ec4 = st.columns(4)
+    ec1.metric("Cumulative Landed Value Div", money(cum_land_div), f"{100*cum_land_div/max(abs(tot_bau_land),1):+.1f}% vs BAU")
+    ec2.metric("Cumulative Fleet Profit Div", money(cum_prof_div), f"{100*cum_prof_div/max(abs(tot_bau_prof),1):+.1f}% vs BAU")
+    ec3.metric("Fleet Sea Days Saved (15-Yr)", f"{cum_days_saved:,.0f} Days", f"-{(cum_days_saved / max(np.sum(bau_days*1e6), 1))*100:.1f}% vs BAU Effort")
+    ec4.metric("Avg Daily Realization (EM)", f"${np.mean(em_rpd):,.0f} / Day", f"+${mean_rpd_gain:,.0f} ({pct_rpd_gain:+.1f}%) vs BAU")
 
-    st.markdown("### 15-Year Revenue Trajectory & Macroeconomic Benchmark Analysis")
+    m1, m2 = st.columns(2)
+    m1.metric("Mean Real YoY Growth (EM)", f"{mean_em_real:+.2f}% / yr", f"Deflated by {inflation*100:.1f}% assumed annual inflation")
+    m2.metric("Mean Nominal YoY Growth (EM)", f"{mean_em_nom:+.2f}% / yr", f"Global Inflation: {inflation*100:.1f}%")
+
+    st.markdown("### 15-Year Revenue & Operational Effort Trajectory")
 
     p1, p2 = st.columns(2)
     with p1:
@@ -714,60 +749,61 @@ with tabs[2]:
         fig_land.add_trace(go.Scatter(x=years_s, y=bau_rev, name="BAU Baseline", line=dict(color="#EF4444", width=2.5), mode="lines+markers"))
         fig_land.add_trace(go.Scatter(x=years_s, y=em_rev, name="EM Intervention", line=dict(color="#10B981", width=2.5), mode="lines+markers",
                                       fill="tonexty", fillcolor="rgba(16, 185, 129, 0.12)"))
-        fig_land.update_layout(title="Annual Landed Value ($ Billions)", xaxis_title="Simulation Year", yaxis_title="USD ($B)", height=350,
+        fig_land.update_layout(title="1. Annual Landed Value (Nominal $ Billions)", xaxis_title="Simulation Year", yaxis_title="USD ($B)", height=340,
                                legend=dict(orientation="h", y=1.12, x=0.15))
         st.plotly_chart(fig_land, width="stretch")
 
         # Chart 2: Nominal YoY Growth Rate (%)
         fig_nom = go.Figure()
-        fig_nom.add_hrect(y0=3.2, y1=4.2, fillcolor="rgba(59, 130, 246, 0.15)", line_width=0, annotation_text="Nominal Target (3.2% - 4.2%)", annotation_position="top right")
+        fig_nom.add_hline(y=cfg.annual_price_drift*100, line_dash="dot", annotation_text="Nominal price assumption; revenue is endogenous")
         fig_nom.add_hline(y=0, line=dict(color="#94A3B8", width=1, dash="dash"))
-        fig_nom.add_trace(go.Scatter(x=years_s[1:], y=bau_nom_yoy[1:], name=f"BAU Nominal (Mean: {np.mean(bau_nom_yoy[1:]):.2f}%)", line=dict(color="#F97316", width=2, dash="dot"), mode="lines+markers"))
-        fig_nom.add_trace(go.Scatter(x=years_s[1:], y=em_nom_yoy[1:], name=f"EM Nominal (Mean: {mean_em_nom:.2f}%)", line=dict(color="#2563EB", width=2.5), mode="lines+markers"))
-        fig_nom.update_layout(title="Nominal YoY Revenue Growth (%) [2.2% Inflation Adjusted]", xaxis_title="Simulation Year", yaxis_title="Nominal Growth (%)", height=350,
+        fig_nom.add_trace(go.Scatter(x=years_s[1:], y=bau_nom_yoy[1:], name=f"BAU Nominal ({np.mean(bau_nom_yoy[1:]):.2f}%)", line=dict(color="#F97316", width=2, dash="dot"), mode="lines+markers"))
+        fig_nom.add_trace(go.Scatter(x=years_s[1:], y=em_nom_yoy[1:], name=f"EM Nominal ({mean_em_nom:.2f}%)", line=dict(color="#2563EB", width=2.5), mode="lines+markers"))
+        fig_nom.update_layout(title="2. Nominal YoY Growth Rate (%)", xaxis_title="Simulation Year", yaxis_title="Nominal Growth (%)", height=340,
                                legend=dict(orientation="h", y=1.12, x=0.05))
         st.plotly_chart(fig_nom, width="stretch")
 
     with p2:
-        # Chart 3: Real YoY Growth Rate (%) vs World Bank Target Corridor
-        fig_real = go.Figure()
-        fig_real.add_hrect(y0=1.0, y1=2.0, fillcolor="rgba(16, 185, 129, 0.20)", line_width=0, annotation_text="World Bank Corridor (1.0% - 2.0%)", annotation_position="top right")
-        fig_real.add_hline(y=0, line=dict(color="#94A3B8", width=1, dash="dash"))
-        fig_real.add_trace(go.Scatter(x=years_s[1:], y=bau_real_yoy[1:], name=f"BAU Real (Mean: {mean_bau_real:.2f}%)", line=dict(color="#EF4444", width=2, dash="dot"), mode="lines+markers"))
-        fig_real.add_trace(go.Scatter(x=years_s[1:], y=em_real_yoy[1:], name=f"EM Real (Mean: {mean_em_real:.2f}%)", line=dict(color="#059669", width=2.5), mode="lines+markers"))
-        fig_real.update_layout(title="Real YoY Revenue Growth (%) vs. World Bank Target Corridor", xaxis_title="Simulation Year", yaxis_title="Real Growth (%)", height=350,
+        # Chart 3: Annual Fleet Fishing Days (Million Days / Yr)
+        fig_days = go.Figure()
+        fig_days.add_trace(go.Scatter(x=years_s, y=bau_days, name="BAU Days (Effort Creep)", line=dict(color="#F59E0B", width=2.2, dash="dash"), mode="lines+markers"))
+        fig_days.add_trace(go.Scatter(x=years_s, y=em_days, name="EM Days (Optimized)", line=dict(color="#06B6D4", width=2.5), mode="lines+markers",
+                                      fill="tonexty", fillcolor="rgba(6, 182, 212, 0.12)"))
+        fig_days.update_layout(title=f"3. Annual Fleet Fishing Days (M Days/yr) [Saved: {cum_days_saved:,.0f} Days]", xaxis_title="Simulation Year", yaxis_title="Fishing Days (M)", height=340,
                                legend=dict(orientation="h", y=1.12, x=0.05))
-        st.plotly_chart(fig_real, width="stretch")
+        st.plotly_chart(fig_days, width="stretch")
 
-        # Chart 4: Annual Landed Value Reform Dividend ($M)
-        fig_div = go.Figure()
-        bar_colors = ["#10B981" if v >= 0 else "#EF4444" for v in landed_div_M]
-        fig_div.add_trace(go.Bar(x=years_s, y=landed_div_M, marker_color=bar_colors, name="Annual Landed Dividend ($M)"))
-        fig_div.add_hline(y=0, line=dict(color="#475569", width=1))
-        fig_div.update_layout(title=f"Annual Landed Value Dividend Stream ($M) [Cumulative: {money(cum_land_div)}]", xaxis_title="Simulation Year", yaxis_title="Dividend ($M)", height=350,
-                              showlegend=False)
-        st.plotly_chart(fig_div, width="stretch")
+        # Chart 4: Landed Value Realization per Fishing Day ($ / Day)
+        fig_eff = go.Figure()
+        fig_eff.add_trace(go.Scatter(x=years_s, y=bau_rpd, name="BAU $/Day", line=dict(color="#EF4444", width=2, dash="dot"), mode="lines+markers"))
+        fig_eff.add_trace(go.Scatter(x=years_s, y=em_rpd, name="EM $/Day (Higher Efficiency)", line=dict(color="#10B981", width=2.5), mode="lines+markers",
+                                     fill="tonexty", fillcolor="rgba(16, 185, 129, 0.10)"))
+        fig_eff.update_layout(title=f"4. Realized Landed Value per Fishing Day ($/Day) [EM: +${mean_rpd_gain:,.0f}/d]", xaxis_title="Simulation Year", yaxis_title="Landed Value ($/Day)", height=340,
+                               legend=dict(orientation="h", y=1.12, x=0.05))
+        st.plotly_chart(fig_eff, width="stretch")
 
     # Interactive Year-by-Year Quantitative Breakdown Table
-    with st.expander(f"📋 Year-by-Year Quantitative Revenue Trajectory Table (Years 1 to {cfg.years})", expanded=True):
+    with st.expander(f"📋 Year-by-Year Quantitative Revenue & Fishing Effort Table (Years 1 to {cfg.years})", expanded=True):
         y_table = pd.DataFrame({
             "Year": [f"Year {y}" for y in years_s],
-            "BAU Landed Value ($B)": [f"${v:.2f}B" for v in bau_rev],
-            "BAU Real YoY (%)": [f"{r:+.2f}%" if i > 0 else "—" for i, r in enumerate(bau_real_yoy)],
-            "BAU Nominal YoY (%)": [f"{r:+.2f}%" if i > 0 else "—" for i, r in enumerate(bau_nom_yoy)],
-            "EM Landed Value ($B)": [f"${v:.2f}B" for v in em_rev],
+            "BAU Landed ($B)": [f"${v:.2f}B" for v in bau_rev],
+            "EM Landed ($B)": [f"${v:.2f}B" for v in em_rev],
+            "Landed Div ($M)": [f"+${d:,.1f}M" for d in landed_div_M],
+            "BAU Fishing Days (M)": [f"{d:.3f}M" for d in bau_days],
+            "EM Fishing Days (M)": [f"{d:.3f}M" for d in em_days],
+            "Days Saved (k)": [f"{s:+,.0f}k" for s in days_saved_k],
+            "BAU $/Day": [f"${r:,.0f}" for r in bau_rpd],
+            "EM $/Day": [f"${r:,.0f}" for r in em_rpd],
+            "Daily Efficiency Div": [f"+${r - b:,.0f}/d" for r, b in zip(em_rpd, bau_rpd)],
             "EM Real YoY (%)": [f"{r:+.2f}%" if i > 0 else "—" for i, r in enumerate(em_real_yoy)],
-            "EM Nominal YoY (%)": [f"{r:+.2f}%" if i > 0 else "—" for i, r in enumerate(em_nom_yoy)],
-            "Annual Dividend ($M)": [f"{d:+,.1f}M" for d in landed_div_M],
-            "Cumulative Dividend ($M)": [f"{c:+,.1f}M" for c in np.cumsum(landed_div_M)],
         })
         st.dataframe(y_table, width="stretch", hide_index=True)
 
     st.info(
-        "💡 **Understanding the Trajectory Dip around Year 8–10:**\n"
-        "- **1. Global Commodity Price Cycle:** Ex-vessel prices follow a Geometric Brownian Motion process calibrated to global seafood market volatility (σ = 12%) and World Bank real secular appreciation (+1.5%/yr). Following a sustained price peak in Years 4–8 ($11,638/tonne), Year 9–10 absorbs a standard down-cycle price retracement ($8,676/tonne).\n"
-        "- **2. Biological Transition to MSY Plateau:** Physical harvests step down from initial high open-access extraction (~2.26 Mt) to the long-term Maximum Sustainable Yield (MSY) equilibrium (~1.39 Mt), stabilizing standing stock biomass at 61%–65% of virgin carrying capacity.\n"
-        "- **3. Secular Rebound:** As protected stocks rebuild, sanctuary spillover into adjacent fishing grounds and resumed commodity price appreciation lift landed value back to $13.63B by Year 15, yielding a 15-year real compound growth rate of **+1.20% (BAU) and +1.46% (EM)**, matching the World Bank 1.0%–2.0% benchmark."
+        "Revenue is catch multiplied by realized price. Stock recovery, fishing access, gear mitigation, "
+        "operating costs and premiums can change the intervention result in either direction. "
+        "The nominal price prior is not a constraint on revenue. Real growth divides nominal growth "
+        "by the inflation factor; inflation is not added to already nominal revenue."
     )
 
     # Secondary metrics: Catch & Climate
@@ -793,8 +829,8 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("🎣 First-to-Last Mile Seafood Connectivity, Traceability & Competitor Landscape")
     st.markdown("""
-    While conventional fisheries monitoring focuses exclusively on **First Mile** operations (at-sea harvest, deck cameras, and gear compliance), 
-    modern sustainable seafood supply chains require seamless digital handoffs across **Middle Mile** (port state clearance, cold chain IoT, cannery processing yield) 
+    While conventional fisheries monitoring focuses exclusively on **First Mile** operations (at-sea harvest, deck cameras, and gear compliance),
+    modern sustainable seafood supply chains require seamless digital handoffs across **Middle Mile** (port state clearance, cold chain IoT, cannery processing yield)
     and **Last Mile** (GDST 1.2 digital twins, US SIMP / EU CATCH import clearance, retail brand premiums, and consumer QR verification).
     """)
 
@@ -912,7 +948,7 @@ with tabs[4]:
     c1,c2=st.columns(2)
     with c1: st.plotly_chart(px.line(a,x="year",y="mpa_share",color="scenario",markers=True,title="Effective protected-area exposure"),width="stretch")
     with c2: st.plotly_chart(px.line(a,x="year",y="management_quality",color="scenario",markers=True,title="Management observability / quality index"),width="stretch")
-    
+
     c3, c4 = st.columns(2)
     with c3:
         st.plotly_chart(px.line(a,x="year",y="illegal_events",color="scenario",markers=True,title="Simulated non-compliant MPA entries (weighted fleet events)"),width="stretch")
@@ -979,9 +1015,9 @@ with tabs[5]:
 with tabs[6]:
     st.subheader("Coupled Multi-Model Scientific Architecture & Mathematical Formulations")
     st.markdown("""
-    The simulation implements a **fully coupled, closed-loop socio-ecological system** where 5 distinct dynamical models interact bidirectionally every simulated month:
+    The simulation implements a **coupled socio-ecological scenario model** with exogenous climate forcing and monthly fleet, stock, management and market feedback:
     """)
-    
+
     cm1, cm2, cm3, cm4, cm5 = st.columns(5)
     with cm1:
         st.markdown("**1. 🌡️ Climate Dynamics**")
@@ -991,13 +1027,13 @@ with tabs[6]:
         st.caption("Discrete choice multinomial logit ground selection; target biomass attraction; crowding congestion penalties; search transit fuel savings (8–18%).")
     with cm3:
         st.markdown("**3. 🚨 Non-Compliance Dynamics**")
-        st.caption("Latent violation propensity; behavioral persistence; enforcement surveillance fines; paper-park sanctuary leakage eroding reserve protection.")
+        st.caption("Latent violation propensity, awareness, behavioral persistence and fines. Illegal fishing removes stock inside reserves; compliant vessels respect closures.")
     with cm4:
         st.markdown("**4. 🐢 Bycatch Dynamics**")
         st.caption("Incidental megafauna capture; EM verified gear mitigation (circle hooks, tori lines) cutting encounters by 40–55%; Conservation Priority steering.")
     with cm5:
         st.markdown("**5. 🐟 Population Dynamics**")
-        st.caption("Multi-species Schaefer logistic surplus growth; spatial environmental carrying capacity; biological spillover buffer rings; basin-wide migration.")
+        st.caption("Multi-species logistic surplus growth, absolute extraction, habitat-dependent capacity and conservative exchange between neighboring ocean cells.")
 
     doc_tab0, doc_tab1, doc_tab2, doc_tab3, doc_tab4, doc_tab5 = st.tabs([
         "Master Technical & Socio-Economic Report",
@@ -1020,20 +1056,21 @@ with tabs[6]:
     with doc_tab5:
         st.markdown(r"""
         ### Coupled Closed-Loop Feedback Channels
-        
+
         | Channel | Source Sub-Model | Target Sub-Model | Transmission Mechanism | System Feedback |
         |:---|:---|:---|:---|:---|
-        | **1. Isotherm Shift** | Climate Model | Population Model | $\Delta \text{lat} = c_t \times 12^\circ$ shifts species habitat suitability poleward | Changes local carrying capacity & abundance |
-        | **2. Heat Shock Loss** | Climate Model | Population Model | Heat-stress natural mortality $-\frac{|c_t| \kappa_c B}{18}$ during extreme shocks | Depletes standing biomass during warming anomalies |
+        | **1. Isotherm Shift** | Climate Model | Population Model | $\Delta \text{lat} = c_t \times 12^\circ$ changes catch availability within a fixed habitat envelope | Changes local CPUE, not carrying capacity |
+        | **2. Heat Shock Loss** | Climate Model | Population Model | Heat-stress natural mortality $-\max(|c_t|-0.20,0)^2 \kappa_c B/12$ during extreme shocks | Depletes standing biomass during warming anomalies |
         | **3. Poleward MPA Drift** | Climate Model | Management / MPAs | Reserve centroid shifts $\vec{\delta}_{\text{climate}} = \pm c_t \times 4.5^\circ$ | Keeps dynamic reserves aligned with migrating stocks |
         | **4. Biomass Attraction** | Population Model | Vessel Fleet Model | Utility attraction $0.82 \log(\bar{B}_{gt})$ | Fleets track productive grounds, altering congestion |
         | **5. Harvest Depletion** | Vessel Fleet Model | Population Model | Harvest extraction $H_{sgt}$ removes biomass from cells | Fleet effort reduces commercial and bycatch stocks |
         | **6. Legal Aversion** | Non-Compliance / MPAs | Vessel Fleet Model | Legal aversion $(0.35 + 4.2 a_i) \text{MPA}_g$ | Displaces compliant vessels to legal buffer grounds |
-        | **7. Paper Park Leakage** | Non-Compliance Model | Population Model | Poaching effort degrades cell protection: $1 - 0.75 \text{eff} \cdot \text{comp}$ | Unenforced MPAs fail to protect biomass (BAU leakage) |
+        | **7. Paper Park Leakage** | Non-Compliance Model | Population Model | Illegal catch is removed from the same physical stock ledger | Unenforced MPAs fail to protect biomass (BAU leakage) |
         | **8. Gear Mitigation** | Vessel Fleet (EM) | Bycatch Model | Circle hooks & tori lines cut encounters by 40–55% | Preserves shark, sea turtle, and seabird populations |
         | **9. Conservation Steering** | Bycatch & Population | Dynamic MPAs | $\Psi(g,t) = \text{Depletion} \times \text{Congestion} + 0.35 \text{BycatchRisk}$ | Reshapes MPAs over depleted & high-bycatch corridors |
-        | **10. Spillover CPUE** | Population Model | Vessel Fleet Model | Biological surplus export into buffer rings ($d \le 2 R_k$) | Raises legal catch per hook-hour near reserve borders |
-        | **11. Observability $Q_t$** | Management Cycle | Vessel Economics | Search savings (8–18%), export price gain (+5–14%), fines | Generates multi-year net economic reform dividend |
+        | **10. Spillover CPUE** | Population Model | Vessel Fleet Model | Conservative exchange along adjacent resident habitat cells | Raises legal catch per hook-hour near reserve borders |
+        | **11. Stock Maturity & Quality** | Population Model | Market Realization | Rebuilt adult stocks yield large sashimi-grade tunas ($+15\%$) while depleted stocks yield small cannery fish | Endogenously drives landed value divergence based on standing stock |
+        | **12. Observability & Trade Access** | Management Cycle | Vessel Economics | Eligible verified catch earns the selected premium; no automatic BAU trade penalty | Premium is an explicit scenario assumption |
         """)
 
 with tabs[7]:
@@ -1043,5 +1080,5 @@ with tabs[7]:
     st.write(f"World-cell source: **{world_source}** ({len(world):,} ocean cells)")
     st.write(f"Real MPA polygon layer: **{'15 verified marine reserves (WDPA / MPAtlas)' if mpa_path else 'not present'}**")
     st.write("Land mask: **Natural Earth 110m Physical Land geometry** (zero cells/vessels on land)")
-    st.write("Fleet value baseline: **$6.0B** calibrated against FAO / World Bank global longline fisheries landings")
+    st.write("Fleet value baseline: **$6.0B nominal** scenario anchor; global capture history informs the price prior")
     st.code("uv run python data_pipeline/build_open_data_pack.py --fetch-realistic",language="bash")

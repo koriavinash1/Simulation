@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from .config import SimulationConfig
+from .coupling import allocate_removals, conservative_exchange, monthly_stock_step
 from .data_adapter import demo_empirical_priors, priors_to_arrays
 
 @dataclass
@@ -80,12 +81,30 @@ def _categorical_sample(p, rng):
     return (u[:, None] > c).sum(axis=1).clip(0, p.shape[1]-1)
 
 
-def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.DataFrame, seed: int, return_vessel_year1=False):
+def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.DataFrame, seed: int, return_vessel_year1=False, _calibration_factor=None):
+    if cfg.years < 1 or cfg.n_vessels < 1 or cfg.representative_agents < 1 or cfg.n_regions < 1:
+        raise ValueError("Years, regions and vessel counts must be positive")
+    if not 0 < cfg.initial_biomass_index < cfg.carrying_capacity_index:
+        raise ValueError("Initial stock must be positive and below carrying capacity")
+    if not 0 <= adoption_pct <= 100 or cfg.em_amortization_years <= 0 or cfg.harvest_pressure_scale <= 0:
+        raise ValueError("Adoption must be in [0, 100]; amortization must be positive")
+    if cfg.annual_price_drift <= -1 or cfg.annual_inflation_rate <= -1 or cfg.annual_fuel_drift <= -1:
+        raise ValueError("Price, fuel and inflation rates must exceed -100%")
+    if _calibration_factor is None:
+        from dataclasses import replace
+        pilot, _ = _run_one(replace(cfg, years=1), 0, empirical_priors, seed,
+                            _calibration_factor=1.0)
+        observed = float(pilot.landed_value.iloc[0])
+        if observed <= 0:
+            raise ValueError("Priors must support positive baseline catch")
+        _calibration_factor = cfg.baseline_landed_value_billion*1e9 / observed
     local_cfg = SimulationConfig(**{**cfg.__dict__, "adoption_pct": adoption_pct})
     # Split random streams so paired BAU/EM worlds share agent traits and exogenous shocks.
     rng_agents = np.random.default_rng(seed + 11)
     rng_adoption = np.random.default_rng(seed + 23)
     rng = np.random.default_rng(seed + 37)
+    rng_market = np.random.default_rng(seed + 41)
+    rng_bio = np.random.default_rng(seed + 43)
     effort_prior, region_mpa, cpue_prior = priors_to_arrays(empirical_priors, cfg.n_regions)
     if region_mpa.mean() > 0:
         region_mpa = np.clip(region_mpa * (cfg.baseline_mpa_share / region_mpa.mean()), 0, 0.70)
@@ -107,20 +126,38 @@ def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.Da
     base_catch_units = (agents["effort"] * agents["catchability"] * agents["capacity"] * agents["skill"]).sum()
     # Calibrate catch scale so year-zero expected landed value approximates the user-specified baseline.
     annual_target_revenue = cfg.baseline_landed_value_billion * 1e9
-    catch_scale = annual_target_revenue / max(base_catch_units * 12 * cfg.base_price_per_tonne * (cfg.n_vessels / n), 1)
+    catch_scale = annual_target_revenue / max(base_catch_units * 12 * cfg.base_price_per_tonne * (cfg.n_vessels / n), 1) * _calibration_factor
+    capacity = np.full(cfg.n_regions, cfg.carrying_capacity_index)
+    # A transparent equilibrium prior converts catch tonnes to stock-index units.
+    reference_catch = np.zeros(cfg.n_regions)
+    vessel_units = agents["effort"]*agents["catchability"]*agents["capacity"]*agents["skill"]*W
+    for month in range(12):
+        attraction = np.log(np.maximum(effort_prior[month], 1e-8))[None,:] + .55*np.log(np.maximum(beliefs, 1e-6))
+        probability = _softmax(attraction - .30*mpa_effective[None,:])
+        probability = (1-cfg.exploration_rate)*probability + cfg.exploration_rate/cfg.n_regions
+        crowd = np.sum(probability*W[:,None],axis=0)/W.sum()
+        crowd_pen = np.clip(1-cfg.crowding_strength*(crowd/np.maximum(base_pref,.01)-1),.55,1.15)
+        baseline_effort = np.clip(1+cfg.management_response_strength*(.5+management_quality)*
+                                 (biomass-cfg.target_biomass_index),.60,1.12)
+        reference_catch += (probability*vessel_units[:,None]).sum(axis=0)*catch_scale*cpue_prior[month]*biomass**cfg.stock_cpue_elasticity*crowd_pen*baseline_effort
+    reference_catch /= 12
+    production = cfg.intrinsic_growth_rate/12*biomass*(1-biomass/capacity)
+    stock_units = reference_catch / np.maximum(production,1e-12)
+    stock_units *= 0.05 / cfg.harvest_pressure_scale
+    reference_supply = float(reference_catch.sum())
+    # Regional engine has no geographic adjacency; conservative all-region exchange
+    # is explicitly a mixing approximation rather than geographic spillover.
+    edges = np.argwhere(np.triu(np.ones((cfg.n_regions,cfg.n_regions),dtype=bool),1))
 
     annual_rows = []
     year1_profit = np.zeros(n)
     stock_asset_proxy = 0.0
-    prev_supply_tonnes = annual_target_revenue / cfg.base_price_per_tonne
     annual_price = cfg.base_price_per_tonne
     fuel_price = cfg.fuel_price_per_litre
 
     for year in range(cfg.years):
-        price_shock = math.exp(cfg.annual_price_drift - 0.5*cfg.annual_price_volatility**2 + rng.normal(0, cfg.annual_price_volatility))
-        fuel_shock = math.exp(cfg.annual_fuel_drift - 0.5*cfg.annual_fuel_volatility**2 + rng.normal(0, cfg.annual_fuel_volatility))
-        annual_price *= price_shock
-        fuel_price *= fuel_shock
+        annual_price = cfg.base_price_per_tonne * ((1.0 + cfg.annual_price_drift) ** year) * math.exp(-0.5 * cfg.annual_price_volatility**2 + rng_market.normal(0, cfg.annual_price_volatility))
+        fuel_price = cfg.fuel_price_per_litre * ((1.0 + cfg.annual_fuel_drift) ** year) * math.exp(-0.5 * cfg.annual_fuel_volatility**2 + rng_market.normal(0, cfg.annual_fuel_volatility))
 
         year_rev = year_profit = year_cost = year_catch = year_effort = year_fuel = year_em_cost = 0.0
         year_mpa_attempts = year_mpa_actual = 0.0
@@ -163,23 +200,28 @@ def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.Da
             distance_mult = 1.0 + displaced * (cfg.displacement_extra_distance_pct/100.0)
 
             effort = agents["effort"] * regional_effort_modifier[region]
-            cpue = cpue_prior[month, region] * (np.maximum(biomass[region], 0.05) ** cfg.stock_cpue_elasticity)
+            cpue = cpue_prior[month, region] * (biomass[region] ** cfg.stock_cpue_elasticity)
             cpue *= crowd_pen[region]
             catch_noise = rng.lognormal(-0.5*cfg.catch_noise_sigma**2, cfg.catch_noise_sigma, n)
             catch_t = catch_scale * effort * agents["catchability"] * agents["capacity"] * agents["skill"] * cpue * catch_noise
 
+            # Legal access reduces extraction before both stock removal and sales.
+            catch_t *= np.where(displaced, 1-regional_mpa, 1.0)
+            catch_t, removals = allocate_removals(catch_t, region, W, biomass, stock_units)
+
             # Landed price includes market supply effect; EM premium is optional and default zero.
-            expected_month_supply = max(prev_supply_tonnes/12.0, 1)
+            expected_month_supply = max(reference_supply, 1)
             total_catch = float(np.sum(catch_t*W))
             supply_ratio = max(total_catch/expected_month_supply, 0.2)
             price = annual_price * (supply_ratio ** (-cfg.supply_elasticity))
-            vessel_price = price * (1.0 + em*(cfg.traceability_premium_pct/100.0))
+            vessel_price = price * (1.0 + (em & ~violated)*(cfg.traceability_premium_pct/100.0))
             revenue = catch_t * vessel_price
 
             fuel_l = effort * agents["fuel_lph"] * agents["transit"] * distance_mult
             fuel_cost = fuel_l * fuel_price
-            operating_cost = fuel_cost + agents["fixed"] + agents["crew"] + agents["var_cost_h"]*effort
-            em_monthly = em * (cfg.em_capex_per_vessel/(12*max(cfg.em_amortization_years,0.25)) + cfg.em_annual_service_cost/12)
+            cost_inflation = (1+cfg.annual_inflation_rate)**year
+            operating_cost = fuel_cost + (agents["fixed"] + agents["crew"] + agents["var_cost_h"]*effort)*cost_inflation
+            em_monthly = em * (cfg.em_capex_per_vessel/(12*max(cfg.em_amortization_years,0.25)) + cfg.em_annual_service_cost*cost_inflation/12)
             risk_loss = cfg.baseline_expected_compliance_loss_annual/12.0 * agents["risk"]
             risk_loss *= np.where(em, 1-cfg.em_risk_reduction_pct/100.0, 1.0)
             total_cost = operating_cost + em_monthly + risk_loss
@@ -192,15 +234,13 @@ def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.Da
             realized_index = np.maximum(catch_t / np.maximum(catch_scale*effort*agents["catchability"]*agents["capacity"]*agents["skill"],1e-9), 0.01)
             beliefs[np.arange(n), region] = 0.82*beliefs[np.arange(n), region] + 0.18*realized_index
 
-            # Monthly biological update by region: logistic growth, catch pressure, MPA refuge/spillover.
-            harvest_by_region = np.bincount(region, weights=catch_t*W, minlength=cfg.n_regions)
-            harvest_share = harvest_by_region / max(harvest_by_region.sum(), 1)
-            growth = (cfg.intrinsic_growth_rate/12.0)*biomass*(1-biomass/cfg.carrying_capacity_index)
-            protection = 1.0 - 0.65*mpa_effective
-            harvest_pressure = (cfg.harvest_pressure_scale/12.0) * harvest_share * protection * cfg.n_regions
-            spill = (cfg.spillover_rate/12.0) * (biomass.mean() - biomass)
-            bio_noise = rng.normal(0, cfg.natural_variability/math.sqrt(12), cfg.n_regions)
-            biomass = np.clip(biomass + growth - harvest_pressure + spill + bio_noise, 0.15, cfg.carrying_capacity_index*1.25)
+            # The same physical catch is removed from stock exactly once.
+            noise = rng_bio.normal(0, cfg.natural_variability/math.sqrt(12), cfg.n_regions)*biomass
+            after_extraction = monthly_stock_step(biomass, capacity, removals, cfg.intrinsic_growth_rate,
+                                                 np.zeros(cfg.n_regions), np.zeros(cfg.n_regions), noise)
+            exchange = conservative_exchange(after_extraction, capacity, stock_units, edges,
+                                             cfg.spillover_rate/(12*max(cfg.n_regions-1,1)))
+            biomass = after_extraction + exchange
 
             year_rev += float(np.sum(revenue*W))
             year_cost += float(np.sum(total_cost*W))
@@ -214,7 +254,6 @@ def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.Da
                 class_profit[cls] += float(np.sum(profit[mask]*W[mask]))
                 class_revenue[cls] += float(np.sum(revenue[mask]*W[mask]))
 
-        prev_supply_tonnes = year_catch
 
         # Annual management cycle. Quality improves with EM-derived observability.
         adoption = em.mean()
@@ -231,10 +270,13 @@ def _run_one(cfg: SimulationConfig, adoption_pct: float, empirical_priors: pd.Da
         row = {
             "year": year+1,
             "landed_value": year_rev,
+            "real_landed_value": year_rev/(1+cfg.annual_inflation_rate)**year,
             "fleet_profit": year_profit,
             "fleet_cost": year_cost,
             "catch_tonnes": year_catch,
             "effort_hours": year_effort,
+            "fishing_days": year_effort / 13.5,
+            "revenue_per_day": year_rev / max(year_effort / 13.5, 1),
             "fuel_litres": year_fuel,
             "em_cost": year_em_cost,
             "biomass_index": float(biomass.mean()),

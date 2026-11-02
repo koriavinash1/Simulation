@@ -1,246 +1,65 @@
-# Global Fisheries Digital-Twin Model: Coupled Multi-Model Architecture
+# Global fisheries model: current coupled specification
 
-## 1. Executive Summary & Plain-Language Overview
+Updated 2 November 2026. [MODEL_CORRECTIONS.md](MODEL_CORRECTIONS.md) records historical sources, reference runs, limitations and test coverage. Earlier real-growth guarantees, Gaussian reserve boundaries and normalized extraction equations are superseded.
 
-The simulator models global longline fisheries as a **fully coupled, closed-loop socio-ecological system**. Rather than treating fishing fleets, fish stocks, compliance, bycatch, and climate as independent static modules, the simulator explicitly couples **5 dynamical sub-models**:
+## 1. Paired scenarios
 
-```mermaid
-graph TD
-    subgraph Climate_Dynamics["1. Climate Dynamics Model"]
-        C1["AR(1) Anomaly Path c(t)"] --> C2["Thermal Isotherm Shift (+12°/unit)"]
-        C1 --> C3["Thermal Stress & Carrying Capacity K(g)"]
-        C1 --> C4["Rare Extreme Heat Mortality Shocks"]
-        C1 --> C5["Poleward Reserve Drift (+4.5°/unit)"]
-    end
+BAU and EM share the starting fleet, reference catch calibration, climate, market shocks and biological random draws. EM adoption, awareness, verified premium, government MPA redesign, enforcement and reallocation support are distinct controls. With all six zero, outputs are exactly identical apart from labels. Climate is shared regardless of its ceiling.
 
-    subgraph Vessel_Fleet["2. Vessel Fleet Dynamics Model"]
-        V1["Vessel Class & Effort E(i)"] --> V2["Discrete Choice Utility U(i,g,t)"]
-        V2 --> V3["Spatial Ground Selection & Land Avoidance"]
-        V3 --> V4["Congestion Crowding Penalty C(g)"]
-        V4 --> V5["Target Catch & Ex-Vessel Revenue"]
-        V5 --> V6["Fuel Burn & Operational Costs"]
-    end
+Each scenario advances monthly; management updates annually. Climate is exogenous, not bidirectionally coupled. Dedicated random streams and fixed elapsed-time policy ramps preserve earlier results when the horizon is extended.
 
-    subgraph Non_Compliance["3. Non-Compliance Dynamics Model"]
-        NC1["Latent Violation Propensity p_viol(i)"] --> NC2["MPA Encounter Decision"]
-        NC2 --> NC3["Persistent Violations History"]
-        NC3 --> NC4["Enforcement Surveillance Fines"]
-        NC2 --> NC5["Paper-Park Sanctuary Leakage Rate"]
-    end
+## 2. Fleet, habitat and protected access
 
-    subgraph Bycatch_Dynamics["4. Bycatch Dynamics Model"]
-        B1["Vulnerable Megafauna (SHK, TUR, SEA)"] --> B2["Incidental Hook Encounters"]
-        B2 --> B3["EM Gear Mitigation (Circle Hooks, Tori Lines)"]
-        B3 --> B4["Incidental Population Mortality"]
-        B1 --> B5["Bycatch Risk Field in Psi(g,t)"]
-    end
+Fleet traits include capacity, fishing hours, catchability, fuel intensity, monthly fixed/crew costs and latent non-compliance. Synthetic vessels target one of four commercial species. Ground choice combines historical preferences, current species biomass, persistence, legal aversion and exploration, restricted to resident habitat.
 
-    subgraph Population_Dynamics["5. Population Dynamics Model"]
-        P1["Multi-Species Logistic Surplus Growth"] --> P2["Local Biomass Density B(c,g,t)"]
-        P2 --> P3["Commercial Harvest & Bycatch Depletion"]
-        P2 --> P4["Spatial Spillover Rings (2.0 R_k)"]
-        P2 --> P5["Basin-Wide Dispersal & Migration"]
-    end
+A displayed coordinate is the monthly operating cell used for all catch, enforcement and protection calculations. Relocation distance contributes to fuel costs; routes between cells are not simulated. Fishing effort uses mean-one lognormal variability, depletion-related effort creep and a management cap responding to stock shortfalls. Fishing days cannot exceed average calendar days per month.
 
-    %% Cross-Model Couplings
-    C2 -.->|"Isotherm Shift"| P5
-    C3 -.->|"Suitability Modulation"| P1
-    C4 -.->|"Extreme Mortality"| P1
-    C5 -.->|"Poleward MPA Shift"| NC2
+Installed reserve polygons use a single dateline-aware transform for rendering and exact fishing-cell point membership, including holes. Polygon expansion and centroid adaptation require government MPA push and enabled redesign. Coarse protection fractions are used explicitly when no polygons are installed. Membership at cell centers is an approximation to fine-scale fishing access.
 
-    P2 ==>|"Local Biomass Attraction & CPUE"| V2
-    V3 ==>|"Harvest Extraction H(g)"| P3
-    V3 -.->|"Congestion Effort E(g)"| NC5
-    
-    NC2 ==>|"Legal Aversion / Enclosure"| V2
-    NC5 ==>|"Sanctuary Protection Erosion"| P3
-    NC4 -.->|"Illegal Fines Deducted"| V6
+Encounter and latent violation determine illegal entry. Awareness and government enforcement reduce violation probability, retaining a nonzero configured residual propensity. Compliant encounters reduce access before catch; illegal vessels can extract within reserves and incur fines. Recorded catch is never discounted again in the stock update.
 
-    V3 ==>|"Hook-Hour Effort"| B2
-    B3 -.->|"Mitigated Incidental Catch"| P3
-    B5 ==>|"Conservation Priority Psi"| NC2
+## 3. Catch and stocks
 
-    P4 ==>|"Buffer Ring CPUE Dividend"| V5
-    V5 -.->|"Global Supply Price Feedback"| V5
+Vessel catch depends on effective effort, capacity, catchability, local stock raised to the CPUE elasticity, suitability, crowding, climate availability and mean-one catch noise. Eligible EM gear mitigation reduces incidental bycatch.
+
+A pre-policy reference year sets the same fixed scale in both worlds to the configured first-year landed-value anchor. This includes actual catch randomness and access. It is not recalibrated in later years. Cell-specific physical stock conversions are inferred from equilibrium surplus production under reference catch, not measured biomass.
+
+For requested cell catch `H`, stock index `B` and physical units per index `u`:
+
+```
+fraction = min(1, u*B/H)        # 1 when H=0
+realized vessel catch = requested vessel catch * fraction[cell]
+stock removal = sum(realized catch * fleet weight) / u
+B_next = clip(B + (r/12)*B*(1-B/K) - removal + exchange - climate_loss + noise, 0, K)
 ```
 
-The system instantiates thousands of synthetic longliner agents across four calibrated size classes (Small coastal, Medium regional, Large industrial, Distant-water freezer). Every simulated month, each sub-model exchanges state variables bidirectionally with other sub-models.
+The same realized catch drives revenue. Increasing extraction increases removal until stocks constrain it. Protection does not create unaccounted refuge benefits. Target stock-removal tonnes equal landed catch tonnes in the monthly ledger; bycatch uses separately labeled synthetic units.
 
----
+Spatial exchange transfers physical stock between neighboring resident cells along differences in `B/K`, conserving every donor debit and receiver credit and limiting availability and receiver space. The regional engine uses conservative all-region mixing as an explicit approximation. Initial stocks lie below carrying capacity; zeros do not receive a positive floor. Growth rates are net surplus-production parameters; the retained `natural_mortality` field is informational.
 
-## 2. Model 1: Climate Dynamics Model
+## 4. Climate
 
-Climate variability is simulated as a bounded autoregressive stochastic process with rare extreme anomaly shocks:
+Climate follows a bounded AR(1) anomaly process with occasional extreme jumps. It modifies catch availability within a fixed habitat envelope. Extra stock mortality is `max(abs(climate)-0.20,0)^2 * species_sensitivity * B / 12`. Proportional stock noise has zero mean before bounds. These response coefficients remain scenario priors. The model does not dynamically move carrying-capacity maps or simulate ocean currents.
 
-$$
-c_t = \rho \, c_{t-1} + \epsilon_t + J_t, \qquad |c_t| \le c_{\max}
-$$
+## 5. Management and EM
 
-where:
-- $\rho = 0.60$ is the autoregressive anomaly persistence.
-- $\epsilon_t \sim \mathcal{N}\left(0, \left(\frac{c_{\max}}{8}\right)^2\right)$ represents monthly climate noise.
-- $J_t$ is a rare jump process triggering extreme climatic events (e.g., El Niño / Marine Heatwaves) with probability $p = 0.025$, where $J_t \sim \pm \text{Uniform}(0.35 c_{\max}, c_{\max})$.
-- $c_{\max} \in [0.0, 1.0]$ is the user-configured climate extremity ceiling.
+EM installation phases in over 36 months and realized fleet share cannot exceed the selected ceiling. Adoption improves observability; awareness separately reduces latent non-compliance. Observability can reduce wasted search fuel and moderate effort on depleted grounds. Government norms and redesign phase in over a fixed 60 months, independently of the run length. Premium realization matures over 24 months. The package does not identify the causal effect of monitoring alone.
 
-### Couplings to Other Sub-Models:
-1. **To Population Dynamics (Thermal Isotherm Shift):** Climate anomalies displace the thermal suitability centroid latitudinally:
-   $$
-   \Delta \text{lat}_t = c_t \times 12.0^\circ
-   $$
-   Species habitat preference shifts poleward during warm anomalies, altering local abundance:
-   $$
-   S_{c, g}(t) = \exp\left(-\frac{1}{2}\left(\frac{\text{lat}_g - \Delta \text{lat}_t}{45.0}\right)^2\right)
-   $$
-2. **To Population Dynamics (Thermal Stress & Extreme Mortality):** Warm anomalies scale carrying capacity and induce heat-stress natural mortality proportional to each species' climate sensitivity $\kappa_c$:
-   $$
-   \text{Loss}_{\text{climate}}(c, g, t) = \frac{|c_t| \cdot \kappa_c \cdot B_c(g, t)}{18.0}
-   $$
-3. **To Spatial MPAs (Poleward Sanctuary Drift):** Marine protected reserve boundaries drift poleward tracking climate-displaced thermal isotherms:
-   $$
-   \vec{\delta}_{\text{climate}}(t) = \pm (c_t \times 4.5^\circ) \cdot \left(0.20 + 0.80 \frac{t}{T_{\max}}\right)
-   $$
-4. **To Vessel Fleet:** As fish stocks relocate poleward, vessels must adjust their ground choice, increasing search transit distances and fuel expenditures.
+## 6. Economics and historical context
 
----
+The default planning assumption is 1.5% annual real price growth. Nominal price growth composes with the 2.2% inflation assumption as `(1.015*1.022)-1 = 3.733%`. This assumption is shared by both worlds; annual variation is mean-one lognormal. The historical comparison instead uses `(159/151)^(1/4)-1`, approximately 1.30% nominal growth per year. Rounded FAO global capture first-sale observations are $151B in 2018, $141B in 2020 and $159B in 2022. These are broad, cross-edition historical proxies used only in the comparison scenario, not a fitted longline price series or evidence for the positive-real-growth planning default. Sources and scope differences are detailed in [MODEL_CORRECTIONS.md](MODEL_CORRECTIONS.md) and stored in `sim/market.py`.
 
-## 3. Model 2: Vessel Fleet Dynamics Model
+Prices respond to current catch relative to a fixed reference supply, so persistent scarcity has a persistent price effect. There is no automatic BAU trade penalty. Premium eligibility respects EM and compliance requirements. Revenue remains endogenous: catches and stock quality can offset or exceed price growth.
 
-### Ground Selection Utility
-Vessel agents choose fishing grounds dynamically each month via a discrete choice multinomial logit framework. The utility for vessel $i$ choosing ocean cell $g$ in month $t$ is:
+```
+revenue = realized catch * nominal species price * quality * eligible premium * supply adjustment
+profit = revenue - fuel - monthly fixed costs - monthly crew costs - variable costs - EM costs - fines
+real_landed_value = nominal_landed_value / (1+inflation)^(year-1)
+```
 
-$$
-U_{igt} = \log\left(H_{ig} + 10^{-9}\right) + 0.82 \log\left(\bar{B}_{gt} + 10^{-4}\right) + 0.65 \, \mathbf{1}_{\{g = g_{i, t-1}\}} - A_{it} \cdot \text{effective\_mpa}(g, t)
-$$
+Monthly cost priors are charged monthly, with nominal inflation applied to nonfuel costs and EM service fees. Nominal values do not receive inflation a second time. The $6B anchor is a scenario input. Current fleet costs can imply operating losses; subsidies and fleet exit/entry are not modeled. Revenue calibration is not profit validation.
 
-where:
-- $H_{ig}$ is historical ground preference based on home port distance and open-access effort distribution.
-- $\bar{B}_{gt}$ is average commercial target biomass density across Yellowfin, Bigeye, Albacore, and Swordfish.
-- $\mathbf{1}_{\{g = g_{i, t-1}\}}$ represents ground fidelity/inertia (steaming persistence).
-- $A_{it} = 0.35 + 4.20 \cdot \text{awareness}_i$ is the legal aversion coefficient. For EM vessels, awareness reduces willingness to fish inside protected cells.
-- $\text{effective\_mpa}(g, t)$ is the cell-level protection index ($0 \le \text{effective\_mpa} \le 0.82$).
-
-Choice probabilities follow multinomial logit mixed with individual exploratory dispersion $\epsilon_i$:
-
-$$
-P(g \mid i, t) = (1 - \epsilon_i) \frac{\exp(U_{igt})}{\sum_h \exp(U_{iht})} + \frac{\epsilon_i}{G}
-$$
-
-### Catch-Per-Unit-Effort (CPUE) & Congestion
-Vessels in cell $g$ experience crowding congestion penalties when localized fishing effort exceeds historical carrying capacity:
-
-$$
-\text{Congestion}(g, t) = \frac{\sum_{i \in g} W_i}{\sum_h \sum_{i \in h} W_i}, \qquad \text{Crowd}(g, t) = \text{clip}\left(1.0 - 0.25\left(\frac{\text{Congestion}(g, t)}{\text{prior}_g} - 1.0\right), 0.48, 1.15\right)
-$$
-
-Local catch-per-unit-effort scales with local stock density and crowding:
-
-$$
-\text{CPUE}_{c, g, t} = B_c(g, t)^{\gamma_B} \cdot \text{Crowd}(g, t)
-$$
-
-where $\gamma_B = 0.85$ is stock-CPUE elasticity. Harvest for vessel $i$ targeting commercial species $c$ is:
-
-$$
-C_{icgt} = \text{scale} \cdot E_{it} \cdot \text{capacity}_i \cdot \text{catchability}_i \cdot \text{CPUE}_{c, g, t} \cdot \epsilon_{\text{catch}, i} \cdot S_{cg}
-$$
-
----
-
-## 4. Model 3: Non-Compliance Dynamics Model
-
-### Latent Violation Propensity
-When a vessel enters or borders a protected cell, an encounter occurs with probability:
-
-$$
-P(\text{encounter}_{it}) = \text{clip}\left(\text{effective\_mpa}(g, t) \cdot \theta_{\text{sens}}, 0.0, 0.95\right)
-$$
-
-Conditional on an encounter, the vessel decides whether to fish illegally based on its latent violation propensity $p^{\text{viol}}_{it}$:
-
-$$
-p^{\text{viol}}_{it} = \max\left(p_{\text{floor}}, \, p_{0, i} \cdot (1 - a_i \mathbf{1}_{\{\text{em}_i\}}) \cdot (1 - 0.55 G_t) \cdot (1 - 0.45 \Delta Q_t) \cdot \phi_i\right)
-$$
-
-where:
-- $p_{0, i} = \text{clip}(p_{\text{base}} (0.60 + 5.0 \, \text{risk}_i), p_{\text{floor}}, 0.45)$ is the baseline risk-adjusted violation probability.
-- $a_i \sim \text{Beta}(2.5, 2.0) \times \frac{\text{Aware}_{\max}}{100}$ is the EM internal awareness shock.
-- $G_t = \frac{\text{EnforcementPush}}{100} \frac{t}{T_{\max}}$ is general policy compliance pressure.
-- $\Delta Q_t = \frac{Q_t - Q_0}{1 - Q_0}$ is the management observability deterrence gain.
-- $\phi_i = 1.0 + \kappa_{\text{viol}} \frac{\min(\text{violations}_i, 3)}{10.0}$ is behavioral persistence (previous violations habituate defiance).
-- $p_{\text{floor}} = 0.0075$ ensures non-compliance is never artificially forced to zero.
-
-### Enforcement Deterrence & Sanctions
-Illegal vessels face surveillance detection and fines scaling with management observability $Q_t$:
-
-$$
-\text{Fine}_{it} = \mathbf{1}_{\{\text{illegal}_{it}\}} \cdot \text{Revenue}_{it} \cdot 1.15 \cdot \left(0.50 + 1.20 \frac{Q_t}{Q_0} \left(1 + \frac{\text{Push}_{\text{enf}}}{100}\right)\right)
-$$
-
-### Coupled Sanctuary Leakage Channel (Paper Park Effect)
-In real fisheries, unenforced MPAs suffer from illegal poaching, turning them into "paper parks." The simulator explicitly couples cell-level non-compliance to realized biological protection:
-
-$$
-\text{illegal\_rate}(g, t) = \frac{\sum_{i \in g, \text{illegal}} W_i E_{it}}{\sum_{i \in g} W_i E_{it} + 10^{-4}}
-$$
-
-$$
-\text{compliance\_efficacy}(g, t) = \text{clip}\left(1.0 - 0.75 \cdot \text{illegal\_rate}(g, t), 0.20, 1.0\right)
-$$
-
-$$
-\text{realized\_cell\_protection}(g, t) = 1.0 - 0.75 \cdot \text{effective\_mpa}(g, t) \cdot \text{compliance\_efficacy}(g, t)
-$$
-
-- In **BAU**, where compliance is weak and enforcement is low, illegal vessels poach inside reserves ($\text{illegal\_rate} \approx 0.70$), degrading nominal reserve protection from 75% down to 20%–35% (sanctuary leakage).
-- In **EM**, awareness, observability, and fines suppress illegal entries ($\text{illegal\_rate} \approx 0.03$), securing true 75% biological harvest protection ($\text{compliance\_efficacy} \approx 1.0$).
-
----
-
-## 5. Model 4: Bycatch Dynamics Model
-
-### Incidental Interactions & Certified Gear Mitigation
-Longline gear interacts incidentally with three vulnerable, non-target megafauna groups:
-- **Pelagic Sharks (SHK):** Blue sharks, silky sharks, oceanic whitetips ($r = 0.08, \kappa = 0.70$).
-- **Marine Turtles (TUR):** Leatherback, loggerhead, and olive ridley sea turtles ($r = 0.06, \kappa = 0.80$).
-- **Seabirds (SEA):** Albatrosses, petrels, and shearwaters ($r = 0.09, \kappa = 0.65$).
-
-Under Electronic Monitoring (EM), mandatory video audits enforce certified bycatch mitigation technologies:
-1. **Circle Hooks (16/0–18/0) & Finfish Bait:** Replace traditional J-hooks, reducing turtle mouth-hooking by 55% and deep shark swallowing by 40%.
-2. **Bird-Scaring Streamer (Tori) Lines & Night Setting:** Reduce seabird dive-attacks on sinking baited hooks by 50%.
-3. **De-Hooking & Release Protocols:** Verified live release guidelines reduce post-capture mortality.
-
-The vessel-level bycatch mitigation factor is:
-
-$$
-\text{mitigation}_{i, c} = 1.0 - \mu_c \cdot \mathbf{1}_{\{\text{em}_i \land \neg \text{illegal}_i\}} \cdot \left(0.50 + 0.50 \frac{Q_t}{\max(Q_0, 0.01)}\right)
-$$
-
-where $\mu_{\text{SHK}} = 0.40$, $\mu_{\text{TUR}} = 0.55$, $\mu_{\text{SEA}} = 0.50$. For unmonitored vessels or illegal poachers, $\text{mitigation} = 1.0$.
-
-Monthly incidental bycatch per vessel is:
-
-$$
-\text{Bycatch}_{i, c, t} = \text{base}_i \cdot \alpha_c \cdot \text{mitigation}_{i, c}
-$$
-
-where $\alpha_{\text{SHK}} = 0.02$, $\alpha_{\text{TUR}} = 0.004$, $\alpha_{\text{SEA}} = 0.003$.
-
-### Bycatch Population Dynamics & Sanctuary Steering
-1. **Incidental Mortality:** Incidental captures deplete bycatch populations in the ecological update:
-   $$
-   H_{\text{bycatch}}(c, g, t) = 0.45 \cdot \text{Harvest}(c, g, t) \cdot \text{realized\_cell\_protection}(g, t)
-   $$
-2. **Conservation Priority Steering:** Megafauna environmental suitability directly pulls dynamic MPAs toward critical breeding grounds and migration bottlenecks:
-   $$
-   \text{BycatchRisk}(g) = 0.50 S_{\text{SHK}, g} + 0.30 S_{\text{TUR}, g} + 0.20 S_{\text{SEA}, g}
-   $$
-   $$
-   \Psi(g, t) = \text{Depletion}(g, t) \cdot \left(0.35 + 0.65 \frac{E_g(t)}{\max_h E_h(t)}\right) + 0.35 \cdot \text{BycatchRisk}(g)
-   $$
-
----
-
-## 6. Model 5: Population Dynamics & Regional Biogeography Model
+## 7. Habitat reference
 
 ### Regional Biogeography & Thermal Envelopes
 Fish species are **not globally ubiquitous**; their biogeographical ranges are strictly governed by sea surface temperatures (SST), thermoclines, dissolved oxygen thresholds, and Regional Fisheries Management Organization (RFMO) ocean basins:
@@ -323,99 +142,4 @@ K_{sg} = K_{0, s} \cdot S_{sg}
 $$
 
 For cells outside resident habitat ($S_{sg} \le 0.015$), $K_{sg} = 0.0$, initial virgin biomass $B_{sg0} = 0.0$, catch share is $0.0$, and biomass remains strictly $0.0$.
-
-### Resident Ecological Transitions
-For resident cells ($S_{sg} > 0.015$), population biomass transitions monthly:
-
-$$
-B_{s, g, t+1} = \text{clip}\left(B_{sgt} + \text{Growth}_{sgt} - \text{Harvest}_{sgt} + \text{SpillGain}_{sgt} - \text{SpillLoss}_{sgt} + \text{Migration}_{sgt} - \text{ClimateShock}_{sgt} + \epsilon_{\text{bio}}, \, 0.001, \, 1.35 K_{sg}\right)
-$$
-
-### Growth and Carrying Capacity
-Surplus biological growth follows the continuous logistic (Schaefer) function discretized monthly within resident habitat:
-
-$$
-\text{Growth}_{sgt} = \frac{r_s}{12} B_{sgt} \left(1.0 - \frac{B_{sgt}}{\max(K_{sg}, 0.08)}\right)
-$$
-
-### Commercial & Bycatch Harvest Extraction
-Harvest pressure is distributed across cells based on weighted vessel catch shares and modulated by realized sanctuary protection:
-
-$$
-\text{Harvest}_{sgt} = \left(\frac{\text{scale}_{\text{harv}}}{12}\right) \cdot \left(\frac{\sum_{i \in g} C_{isgt} W_i}{\sum_h \sum_{i \in h} C_{isgt} W_i}\right) \cdot G \cdot \text{realized\_cell\_protection}(g, t)
-$$
-
-### Biological Spillover Buffer Rings
-Marine reserves accumulate surplus biomass ($B > 0.85 \bar{B}_{\text{basin}}$). This biological surplus diffuses into adjacent fishing grounds via the spatial spillover ring kernel ($d \le 2.0 R_k$):
-
-$$
-\text{Ring}_k(g) = 4.0 \left(\frac{d_{gk}}{R_k}\right)^2 \exp\left(-1.8 \left(\frac{d_{gk}}{R_k}\right)^2\right)
-$$
-
-$$
-\text{SpillGain}_{sgt} = \left(\frac{S_{\text{rate}}}{12}\right) \cdot \text{Ring}(g) \cdot \max\left(0, \bar{B}_{\text{reserves}} - 0.85 \bar{B}_{\text{basin}}\right) \cdot S_{sg}
-$$
-
-This biological spillover elevates CPUE in the legal fishing buffer zones surrounding MPAs, creating an economic dividend for compliant fishers.
-
----
-
-## 7. Coupling Matrix: Summary of System Feedback Channels
-
-| Coupling Channel | Originating Sub-Model | Receiving Sub-Model | Transmission Mechanism | Direction & Impact |
-|:---|:---|:---|:---|:---|
-| **1. Thermal Isotherm Shift** | Climate Model | Population Model | $\Delta \text{lat} = c_t \times 12^\circ$ shifts species suitability poleward | Changes local carrying capacity & distribution |
-| **2. Heat Stress Mortality** | Climate Model | Population Model | Natural mortality $-\frac{\|c_t\| \kappa_c B}{18}$ during heatwaves | Depletes standing biomass during extreme shocks |
-| **3. Poleward Reserve Drift** | Climate Model | Management / MPAs | Reserve centroid shifts $\vec{\delta}_{\text{climate}} = \pm c_t \times 4.5^\circ$ | Keeps sanctuaries aligned with migrating stocks |
-| **4. Biomass Density Attraction** | Population Model | Vessel Fleet Model | Utility attraction $0.82 \log(\bar{B}_{gt})$ | Fleets track productive grounds, altering congestion |
-| **5. Harvest Depletion** | Vessel Fleet Model | Population Model | Extraction $H_{sgt}$ removes biomass from cells | Fleet effort reduces commercial & bycatch stocks |
-| **6. Legal Aversion & Enclosure** | Non-Compliance / MPAs | Vessel Fleet Model | Legal aversion $(0.35 + 4.2 a_i) \text{MPA}_g$ | Displaces compliant vessels to legal buffer grounds |
-| **7. Paper Park Sanctuary Leakage** | Non-Compliance Model | Population Model | Illegal effort erodes protection $(1 - 0.75 \text{eff} \cdot \text{comp})$ | Unenforced MPAs fail to protect biomass (BAU leakage) |
-| **8. Verified Bycatch Mitigation** | Vessel Fleet (EM) | Bycatch Model | Circle hooks & tori lines cut encounters by 40–55% | Preserves shark, sea turtle, and seabird populations |
-| **9. Conservation Steering $\Psi(g,t)$** | Bycatch & Population | Dynamic MPAs | Depletion $\times$ Congestion $+$ Bycatch Risk | Reshapes MPAs over overfished corridors |
-| **10. Spillover CPUE Dividend** | Population Model | Vessel Fleet Model | Diffusion export into buffer rings ($d \le 2 R_k$) | Raises legal catch per hook-hour near reserve borders |
-| **11. Management Observability $Q_t$** | Management Cycle | Vessel Economics | Search savings (8–18%), export price gain (+5–14%), fines | Generates multi-year net economic reform dividend |
-
----
-
-## 8. Economic Accounting & Fisheries Reform Dividends
-
-Monthly net vessel operating profit is:
-
-$$
-\Pi_{it} = \text{Revenue}_{it} - \text{FuelCost}_{it} - \frac{\text{Fixed}_i + \text{Crew}_i}{12} - \text{VariableEffortCost}_{it} - \text{EMCost}_i - \text{Fine}_{it}
-$$
-
-### Macroeconomic Growth & Inflation Benchmarking (World Bank Calibration)
-Ex-vessel price indices incorporate long-term global macroeconomic fundamentals:
-- **World Bank Benchmark (*Fish to 2030* & *The Sunken Billions Revisited*):** Wild marine capture production volume is ecologically capped at ~90 Mt. Rising middle-class disposable income and population growth drive wild fish price appreciation (+1.2% to 1.8% annually in real terms), yielding **1.0% to 2.0% annual real revenue growth**.
-- **Inflation Adjustment:** With baseline global commodity inflation modeled at $\pi = 2.2\%$ annually, nominal industry revenue expands at **3.0% to 4.5% per year** ($g_{\text{nominal}} \approx g_{\text{real}} + \pi$).
-- **Coupled Price Index Formulation:**
-  $$P_t = P_0 \cdot (1 + \mu_{\text{real}})^t \cdot \exp\left(-\frac{1}{2}\sigma_p^2 + \sigma_p \epsilon_t\right)$$
-  where $\mu_{\text{real}} = 0.015$ (1.5% annual real drift) and $\sigma_p$ represents monthly price volatility.
-
-The simulator reports annual landed value, fleet operating profit, target catch, and the cumulative economic reform dividend (EM Twin vs BAU Twin). Four bioeconomic mechanisms generate this dividend:
-1. **Biological Spillover:** Elevated CPUE near rebuilt reserves boosts landings per trip.
-2. **Search Transit Efficiency:** Observability $Q_t$ and electronic logbooks eliminate blind search steaming, reducing fuel burn by 8% to 18%.
-3. **Traceability Price Realization:** Certified sustainable catch avoids IUU trade sanctions and commands a +5% to +14% market price premium.
-4. **Enforcement Deterrence:** Surveillance fines deter free-rider poaching, protecting legitimate fishers' resource rents.
-
----
-
-## 9. References & Scientific Citations
-
-1. **Collette, B. B., & Nauen, C. E. (1983).** *Scombrids of the World: An Annotated and Illustrated Catalogue of Tunas, Mackerels, Bonitos, and Related Species Known to Date*. FAO Fisheries Synopsis No. 125, Vol. 2. Food and Agriculture Organization of the United Nations (FAO), Rome.
-2. **FAO Fisheries & Aquaculture Department. (2022).** *Species Fact Sheets: Thunnus alalunga (Bonnaterre, 1788)*. FAO Species Identification and Data Programme. Rome: FAO.
-3. **FAO Fisheries & Aquaculture Department. (2022).** *The State of World Fisheries and Aquaculture 2022 (SOFIA): Towards Blue Transformation*. Rome: FAO.
-4. **Lehodey, P., Senina, I., & Murtugudde, R. (2008).** *A Spatial Ecosystem And Populations Dynamics Model (SEAPODYM) – Modeling of tuna and tuna-like populations*. Progress in Oceanography, 78(4), 304–318.
-5. **Lehodey, P., Hampton, J., et al. (2013).** *Vulnerability of Pacific island fisheries and aquaculture to climate change: Oceanic fisheries*. Secretariat of the Pacific Community (SPC), Noumea.
-6. **ICCAT. (2020).** *Report of the 2020 ICCAT Albacore Stock Assessment Session*. International Commission for the Conservation of Atlantic Tunas, SCRS/2020/011, Madrid, Spain.
-7. **WCPFC. (2021).** *Stock Assessment of South Pacific Albacore Tuna*. Western and Central Pacific Fisheries Commission Scientific Committee Seventeenth Regular Session (WCPFC-SC17-2021/SA-WP-02).
-8. **IATTC. (2022).** *Tunas, Billfishes and Other Pelagic Species in the Eastern Pacific Ocean in 2021*. Inter-American Tropical Tuna Commission Fishery Status Report No. 20, La Jolla, CA.
-9. **IOTC. (2021).** *Executive Summary of the Status of the Albacore Tuna (ALB) Resource in the Indian Ocean*. Indian Ocean Tuna Commission Scientific Committee Report, Victoria, Seychelles.
-10. **World Bank. (2013).** *Fish to 2030: Prospects for Fisheries and Aquaculture*. World Bank Report No. 83177-GLB, Washington, DC.
-11. **World Bank. (2017).** *The Sunken Billions Revisited: Progress and Challenges in Global Marine Fisheries*. Environment and Development Series. Washington, DC: World Bank.
-12. **Froese, R., & Pauly, D. (Eds.). (2023).** *FishBase: World Wide Web electronic publication*. Species summary for *Thunnus alalunga* (Albacore), *Thunnus albacares* (Yellowfin tuna), and *Thunnus obesus* (Bigeye tuna). Available at: www.fishbase.org.
-13. **Natural Earth. (2023).** *1:110m Physical Vectors: Land and Minor Islands*. Natural Earth Public Domain Map Dataset.
-14. **UNEP-WCMC & IUCN. (2024).** *Protected Planet: The World Database on Protected Areas (WDPA)*. Cambridge, UK: UNEP-WCMC.
 

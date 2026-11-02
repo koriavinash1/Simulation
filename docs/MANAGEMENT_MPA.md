@@ -1,3 +1,5 @@
+> **Implementation update:** See [MODEL_CORRECTIONS.md](MODEL_CORRECTIONS.md) for the current specification. Exposure uses the same transformed polygons as the map. Protection reduces access before catch; recorded catch removes stock once. Older Gaussian fields, independent spillover gains and numerical dividend claims below are historical descriptions, not current validation.
+
 # Management, Observability, and Coupled MPA Dynamics
 
 ## 1. Overview: The Twin Roles of Electronic Monitoring
