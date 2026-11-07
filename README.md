@@ -1,103 +1,75 @@
-# Blurgs Global Fisheries Digital Twin
+# Tuna Fisheries Monte Carlo Simulator
 
-A Streamlit multi-agent bioeconomic/ecosystem simulator for exploring how Electronic Monitoring (EM), government MPA policy, vessel reallocation, persistent non-compliance, climate variability, fisheries management, fish populations and economic outcomes interact in global tuna longline fisheries.
+A research/policy sandbox for exploring coupled tuna-stock, fishing-effort, EM adoption, IUU, market, MPA and blue-finance dynamics over multi-year horizons.
 
-## Package management
+> **Important:** default coefficients are illustrative policy hypotheses until calibrated to frozen RFMO, GFW, observer/EM, market and finance datasets. This is not a stock assessment or financial forecast.
 
-This project uses **uv** as the canonical Python package and environment manager. Dependencies are declared in `pyproject.toml`. Run `uv lock` once in a networked environment to create the reproducible `uv.lock`, then commit that lockfile. Use `uv` for installation, execution, testing, and dependency updates.
+## Quick start with uv
 
-Common commands:
-
-```bash
-uv lock                         # resolve dependencies and create/update uv.lock
-uv sync                         # create/update .venv from uv.lock
-uv run streamlit run app.py     # launch the app
-uv run python run_cli.py        # run CLI simulation
-uv run pytest -q                # run tests
-```
-
-For development dependencies, `uv sync` installs the default `dev` dependency group containing pytest.
-
-## Current model and historical revenue context
-
-See [coupling corrections, historical FAO sources and current verification](docs/MODEL_CORRECTIONS.md). Revenue is nominal USD; inflation-adjusted revenue is reported separately. All intervention controls at zero produce identical BAU and EM outputs. The default planning scenario assumes 1.5% real price growth and composes inflation into nominal prices. A historical nominal-proxy comparison remains available. Neither scenario forces revenue to grow.
-
-## Master Technical & Socio-Economic Report
-
-For the complete mathematical specification, simulation philosophy, bioeconomic J-curve valuation, crew livelihood analysis, and World Bank macroeconomic growth benchmarking, refer to:
-
-👉 **[`docs/COMPREHENSIVE_MODEL_REPORT.md`](docs/COMPREHENSIVE_MODEL_REPORT.md)**
-
-## Core positioning
-
-EM is **not** modeled as perfect surveillance. Its primary behavioral mechanism is awareness/transparency: adopting vessels draw a heterogeneous reduction in latent non-compliance propensity, while a non-zero residual illegal-entry probability always remains. Government MPA expansion, management, enforcement/norm pressure and reallocation support are independent policy mechanisms.
-
-The model runs paired BAU and EM worlds with the same starting fleet and stochastic climate process.
-
-## Run
+Install `uv`, then from the project directory. The first `uv sync` resolves dependencies and creates `uv.lock`:
 
 ```bash
-uv lock
-uv sync
+uv sync --group dev
 uv run streamlit run app.py
 ```
 
-Or use the included launcher:
+Open the URL Streamlit prints, usually `http://localhost:8501`.
+
+## Run from the CLI
 
 ```bash
-./run_app.sh
+uv run tuna-sim --years 30 --replicates 100 --vessels 7000 --bond-size 15
 ```
 
-## Main controls
-
-The user only controls high-level scenario/extremity variables:
-
-- maximum EM adoption (%)
-- maximum EM awareness effect (%)
-- maximum premium (%)
-- maximum government MPA expansion/redesign push (%)
-- maximum reallocation support (%)
-- maximum general compliance push (%)
-- maximum climate extremity (%)
-- simulation horizon / random seed / representative-agent count
-
-Most other parameters are reference priors in `sim/global_config.py` and are documented in `docs/PARAMETER_REFERENCES.md`.
-
-## Single global canvas
-
-The Global Animation tab displays:
-
-- synthetic longliner agents moving collectively across global pelagic fishing cells
-- EM-enabled vs non-EM agents
-- simulated non-compliant MPA entries
-- coarse MPA exposure cells (or a locally installed current MPA polygon data pack)
-- species-abundance indicator layer
-- animated monthly time control
-
-Additional tabs show species depletion/recovery, landed value, profit, MPA policy, management quality and agent-level outcome distributions.
-
-## Data-pack design
-
-The repository runs without external downloads using clearly-labelled fallback priors. Publication/production use should install a calibrated open-data pack:
-
-- GFW: longline effort/behavioral priors
-- WCPFC/IOTC/ICCAT/IATTC/CCSBT: catch, effort, species composition, CPUE
-- OBIS/GBIF: species occurrence/suitability indicators
-- Protected Planet/WDPCA: all current marine protected/conserved-area polygons
-- Copernicus/NOAA: SST/productivity/heat-wave inputs
-- FAO/GLOBEFISH + public port/trade sources: species/region ex-vessel prices
-- RFMO observer/bycatch sources: shark/turtle/seabird encounter distributions
-
-This repository does not redistribute datasets whose terms may require registration, API tokens or commercial permission. Use `data_pipeline/build_open_data_pack.py` to normalize authorised local exports.
+Outputs are written under `outputs/cli_run/` by default.
 
 ## Tests
 
 ```bash
-uv run pytest -q
+uv run pytest
 ```
 
-Tests include paired-world identity, horizon consistency, stock conservation and extraction accounting, spatial boundaries and economic output checks.
+## Project structure
 
-## Important interpretation
+```text
+.
+├── app.py                       # Streamlit UI
+├── pyproject.toml               # uv/Python project definition
+├── uv.lock                      # generated by `uv sync` / `uv lock`
+├── simulator/
+│   ├── __init__.py
+│   ├── config.py                # canonical scenario/finance configuration
+│   ├── engine.py                # coupled Monte Carlo engine
+│   ├── reporting.py             # compact horizon reporting
+│   └── cli.py                   # command-line runner
+├── tests/
+├── configs/
+├── docs/
+├── outputs/
+└── .streamlit/config.toml
+```
 
-All illegal/non-compliance events in the simulator are synthetic latent behavior. The application must not be used to accuse a named real vessel based on AIS gaps or apparent fishing activity alone.
+## What the Streamlit app lets you vary
+
+- simulation horizon, vessels, Monte Carlo replicates and seed;
+- initial EM adoption, awareness, premium and detection strength;
+- initial/max MPA and dynamic-MPA behavior;
+- awareness-linked avoidable mortality and recruitment protection;
+- demand growth and intervention effort cap;
+- blue-finance pool size, grants/loans, concessional rate, market rate, loan term, capex/refinancing allocation and eligibility thresholds.
+
+The app reports BAU versus intervention distributions for biomass, catch, CPUE, effort, profit, IUU, adoption, blue-finance reach, debt-service burden and a transparent economic-resilience proxy.
+
+## Reproducibility
+
+BAU and intervention use common random numbers for exogenous shocks. Each run is deterministic for a fixed config and master seed.
+
+## Methodology
+
+See:
+
+- `docs/MODEL_METHODS_AND_COUPLING.md`
+- `docs/BLUE_FINANCE_MODEL.md`
+- `docs/EXECUTION_PATH.md`
+- `docs/MODEL_NOTES.md`
+- `docs/SOURCES.md`

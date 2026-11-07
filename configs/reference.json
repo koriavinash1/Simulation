@@ -1,0 +1,14 @@
+{
+  "years": 30,
+  "n_vessels": 7000,
+  "n_replicates": 100,
+  "seed": 20261107,
+  "initial_em_adoption": 0.30,
+  "awareness_campaign_strength": 0.55,
+  "max_verified_premium": 0.05,
+  "initial_mpa": 0.10,
+  "max_mpa": 0.30,
+  "dynamic_mpa": true,
+  "demand_growth": 0.012,
+  "blue_finance_pool_musd": 15.0
+}
